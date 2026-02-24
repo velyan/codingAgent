@@ -36,6 +36,11 @@ DEFAULT_CONTROL_POLL_MS = 500
 DEFAULT_REVIEW_CADENCE_SECONDS = 7.0
 DEFAULT_REVIEWER_LEASE_SECONDS = 60
 DEFAULT_REVIEWER_HEARTBEAT_SECONDS = 10
+DEFAULT_RUN_TIMEOUT_SECONDS = 1800
+DEFAULT_PAUSE_TIMEOUT_SECONDS = 900
+DEFAULT_MAX_NUDGES_PER_RUN = 3
+DEFAULT_MAX_RESTARTS_PER_RUN = 6
+DEFAULT_MAX_IDENTICAL_FAILURES = 3
 
 TASK_CREATED = "task.created"
 TASK_CLAIMED = "task.claimed"
@@ -62,6 +67,7 @@ RUN_INTERRUPTED = "run.interrupted"
 RUN_PAUSED = "run.paused"
 RUN_RESUMED = "run.resumed"
 RUN_RESTARTED = "run.restarted"
+GUARDRAIL_BREACHED = "guardrail.breached"
 
 TASK_LIFECYCLE_KINDS: set[str] = {
     TASK_CREATED,
@@ -207,6 +213,7 @@ class ChainView:
     rework_count: int = 0
     failure_count: int = 0
     recent_failure_signatures: list[str] = field(default_factory=list)
+    last_guardrail: str | None = None
 
 
 @dataclass
@@ -235,6 +242,10 @@ class RunView:
     reviewer_lease_expires_at: datetime | None = None
     review_outcome: str | None = None
     reviewed_at: datetime | None = None
+    nudge_count: int = 0
+    restart_count: int = 0
+    paused_since: datetime | None = None
+    last_guardrail: str | None = None
     completed_at: datetime | None = None
 
     def is_active(self, now: datetime) -> bool:
@@ -295,6 +306,11 @@ class RunConfig:
     review_cadence_seconds: float = DEFAULT_REVIEW_CADENCE_SECONDS
     reviewer_lease_seconds: int = DEFAULT_REVIEWER_LEASE_SECONDS
     reviewer_heartbeat_seconds: int = DEFAULT_REVIEWER_HEARTBEAT_SECONDS
+    run_timeout_seconds: int = DEFAULT_RUN_TIMEOUT_SECONDS
+    pause_timeout_seconds: int = DEFAULT_PAUSE_TIMEOUT_SECONDS
+    max_nudges_per_run: int = DEFAULT_MAX_NUDGES_PER_RUN
+    max_restarts_per_run: int = DEFAULT_MAX_RESTARTS_PER_RUN
+    max_identical_failures: int = DEFAULT_MAX_IDENTICAL_FAILURES
 
 
 @dataclass

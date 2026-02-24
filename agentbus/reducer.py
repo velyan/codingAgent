@@ -8,7 +8,13 @@ from agentbus.models import (
     ACTION_REJECTED,
     CHAIN_COMPLETED,
     CONTROL_SEVERITY,
+    DEFAULT_MAX_IDENTICAL_FAILURES,
+    DEFAULT_MAX_NUDGES_PER_RUN,
+    DEFAULT_MAX_RESTARTS_PER_RUN,
+    DEFAULT_PAUSE_TIMEOUT_SECONDS,
+    DEFAULT_RUN_TIMEOUT_SECONDS,
     ESCALATION_RAISED,
+    GUARDRAIL_BREACHED,
     OBJECTIVE_CREATED,
     REVIEWER_CONTROL_APPLIED,
     REVIEWER_CONTROL_REJECTED,
@@ -181,7 +187,7 @@ def reduce_events(events: list[dict[str, Any]]) -> ReducedState:
                     chain.failure_count += 1
                     if signature:
                         chain.recent_failure_signatures.append(signature)
-                        chain.recent_failure_signatures = chain.recent_failure_signatures[-3:]
+                        chain.recent_failure_signatures = chain.recent_failure_signatures[-50:]
                 if task.run_id and task.run_id in state.runs:
                     run = state.runs[task.run_id]
                     run.status = "failed"
@@ -208,11 +214,15 @@ def reduce_events(events: list[dict[str, Any]]) -> ReducedState:
         elif kind == RUN_PAUSED and run_id and run_id in state.runs:
             run = state.runs[run_id]
             run.status = "paused"
+            run.paused_since = event_ts
             run.updated_at = event_ts
 
         elif kind in {RUN_RESUMED, RUN_RESTARTED} and run_id and run_id in state.runs:
             run = state.runs[run_id]
             run.status = "running"
+            run.paused_since = None
+            if kind == RUN_RESTARTED:
+                run.restart_count += 1
             run.updated_at = event_ts
 
         elif kind == REVIEWER_SUPERVISION_CLAIMED and run_id and run_id in state.runs:
@@ -258,6 +268,12 @@ def reduce_events(events: list[dict[str, Any]]) -> ReducedState:
                 state.pending_controls[run_id] = [
                     request for request in state.pending_controls[run_id] if request.event_id != chosen_id
                 ]
+            if run_id and run_id in state.runs:
+                run = state.runs[run_id]
+                action = str(data.get("action") or "")
+                if action == "nudge":
+                    run.nudge_count += 1
+                run.updated_at = event_ts
 
         elif kind == REVIEWER_CONTROL_REJECTED:
             rejected_id = str(data.get("rejected_event_id") or "")
@@ -286,6 +302,15 @@ def reduce_events(events: list[dict[str, Any]]) -> ReducedState:
         elif kind == ESCALATION_RAISED and chain is not None:
             chain.escalations += 1
             chain.paused = True
+
+        elif kind == GUARDRAIL_BREACHED:
+            rule = str(data.get("rule") or "")
+            if chain is not None:
+                chain.last_guardrail = rule or chain.last_guardrail
+            if run_id and run_id in state.runs:
+                run = state.runs[run_id]
+                run.last_guardrail = rule or run.last_guardrail
+                run.updated_at = event_ts
 
         elif kind == CHAIN_COMPLETED and chain is not None:
             chain.completed = True
@@ -403,6 +428,11 @@ def summarize_state(state: ReducedState, *, chain_id: str | None = None) -> dict
                 "handoffs": chain.handoff_count,
                 "reworks": chain.rework_count,
                 "failures": chain.failure_count,
+                "chain_guardrail_state": {
+                    "failure_count": chain.failure_count,
+                    "recent_failure_signatures": list(chain.recent_failure_signatures),
+                    "last_guardrail": chain.last_guardrail,
+                },
                 "objective": chain.objective,
             }
         )
@@ -419,6 +449,10 @@ def summarize_state(state: ReducedState, *, chain_id: str | None = None) -> dict
                     "executor": run.executor_agent_id,
                     "reviewer": run.reviewer_agent_id,
                     "backend": run.backend,
+                    "nudge_count": run.nudge_count,
+                    "restart_count": run.restart_count,
+                    "paused_since": run.paused_since.isoformat().replace("+00:00", "Z") if run.paused_since else None,
+                    "last_guardrail": run.last_guardrail,
                 }
             )
 
@@ -429,5 +463,12 @@ def summarize_state(state: ReducedState, *, chain_id: str | None = None) -> dict
         "task_counts": dict(task_counts),
         "chains": chain_summaries,
         "active_runs": active_runs,
+        "guardrail_config": {
+            "run_timeout_seconds": DEFAULT_RUN_TIMEOUT_SECONDS,
+            "pause_timeout_seconds": DEFAULT_PAUSE_TIMEOUT_SECONDS,
+            "max_nudges_per_run": DEFAULT_MAX_NUDGES_PER_RUN,
+            "max_restarts_per_run": DEFAULT_MAX_RESTARTS_PER_RUN,
+            "max_identical_failures": DEFAULT_MAX_IDENTICAL_FAILURES,
+        },
         "total_tasks": sum(task_counts.values()),
     }

@@ -10,12 +10,17 @@ from agentbus.models import (
     DEFAULT_HEARTBEAT_SECONDS,
     DEFAULT_LEASE_SECONDS,
     DEFAULT_MAX_FAILURES,
+    DEFAULT_MAX_IDENTICAL_FAILURES,
     DEFAULT_MAX_HANDOFFS,
+    DEFAULT_MAX_NUDGES_PER_RUN,
     DEFAULT_MAX_REWORKS,
+    DEFAULT_MAX_RESTARTS_PER_RUN,
     DEFAULT_POLL_SECONDS,
     DEFAULT_PRIORITY,
+    DEFAULT_PAUSE_TIMEOUT_SECONDS,
     DEFAULT_REVIEW_CADENCE_SECONDS,
     DEFAULT_REVIEWER_LEASE_SECONDS,
+    DEFAULT_RUN_TIMEOUT_SECONDS,
     DEFAULT_STREAM_CHUNK_BYTES,
     Budgets,
     RunConfig,
@@ -35,6 +40,13 @@ def _add_common_budget_flags(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--max-handoffs", type=int, default=DEFAULT_MAX_HANDOFFS)
     parser.add_argument("--max-reworks", type=int, default=DEFAULT_MAX_REWORKS)
     parser.add_argument("--max-failures", type=int, default=DEFAULT_MAX_FAILURES)
+
+
+def _positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("value must be > 0")
+    return parsed
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -59,6 +71,11 @@ def _build_parser() -> argparse.ArgumentParser:
     run.add_argument("--control-poll-ms", type=int, default=DEFAULT_CONTROL_POLL_MS)
     run.add_argument("--review-cadence-seconds", type=float, default=DEFAULT_REVIEW_CADENCE_SECONDS)
     run.add_argument("--reviewer-lease-seconds", type=int, default=DEFAULT_REVIEWER_LEASE_SECONDS)
+    run.add_argument("--run-timeout-seconds", type=_positive_int, default=DEFAULT_RUN_TIMEOUT_SECONDS)
+    run.add_argument("--pause-timeout-seconds", type=_positive_int, default=DEFAULT_PAUSE_TIMEOUT_SECONDS)
+    run.add_argument("--max-nudges-per-run", type=_positive_int, default=DEFAULT_MAX_NUDGES_PER_RUN)
+    run.add_argument("--max-restarts-per-run", type=_positive_int, default=DEFAULT_MAX_RESTARTS_PER_RUN)
+    run.add_argument("--max-identical-failures", type=_positive_int, default=DEFAULT_MAX_IDENTICAL_FAILURES)
 
     post_obj = sub.add_parser("post-objective", help="Post a new objective chain")
     post_obj.add_argument("--log-file", required=True)
@@ -129,6 +146,11 @@ def main(argv: list[str] | None = None) -> int:
             control_poll_ms=int(args.control_poll_ms),
             review_cadence_seconds=float(args.review_cadence_seconds),
             reviewer_lease_seconds=int(args.reviewer_lease_seconds),
+            run_timeout_seconds=int(args.run_timeout_seconds),
+            pause_timeout_seconds=int(args.pause_timeout_seconds),
+            max_nudges_per_run=int(args.max_nudges_per_run),
+            max_restarts_per_run=int(args.max_restarts_per_run),
+            max_identical_failures=int(args.max_identical_failures),
         )
         run_agent(cfg)
         return 0
