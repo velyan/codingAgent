@@ -1,0 +1,30 @@
+from agentbus.actions import parse_agentbus_actions
+
+
+def test_parse_valid_actions() -> None:
+    payload = """
+```json
+{
+  "agentbus_actions": [
+    {"type": "steer", "run_id": "r1", "action": "pause", "message": "hold"},
+    {"type": "create_task", "target_role": "executor", "prompt": "do x", "target_backend": ["codex"]}
+  ]
+}
+```
+"""
+    result = parse_agentbus_actions(payload)
+    assert len(result.actions) == 2
+    assert not result.rejected_reasons
+    assert result.actions[0].type == "steer"
+    assert result.actions[0].payload["action"] == "pause"
+
+
+def test_parse_rejects_invalid_action() -> None:
+    payload = """
+```json
+{"agentbus_actions": [{"type": "steer", "run_id": "r1", "action": "bad"}]}
+```
+"""
+    result = parse_agentbus_actions(payload)
+    assert len(result.actions) == 0
+    assert any("unsupported steer action" in reason for reason in result.rejected_reasons)

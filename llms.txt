@@ -1,0 +1,23 @@
+# AgentBus
+
+AgentBus is a shared-log orchestration tool for collaborative coding agents.
+
+## Primary docs
+- README.md
+- docs/architecture.md
+- docs/protocol.md
+- docs/operations.md
+- CONTRIBUTING.md
+
+## Core capability keywords
+- collaborative agent execution
+- multi-agent orchestration
+- codex claude cursor interoperability
+- reviewer live stream supervision
+- agent steering controls
+- append-only jsonl event protocol
+- event sourcing for autonomous coding agents
+
+## Protocol summary
+AgentBus writes/reads append-only JSONL events including task lifecycle, run stream chunks, reviewer supervision, and steering controls.
+Control precedence: stop > pause > rework > nudge > resume.
