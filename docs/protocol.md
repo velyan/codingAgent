@@ -49,6 +49,7 @@ AgentBus protocol is event-sourced. Each JSON line is one event object.
 - `review.rework_requested`
 - `escalation.raised`
 - `chain.completed`
+- `guardrail.breached`
 
 ## Live Supervision Events
 
@@ -62,6 +63,7 @@ AgentBus protocol is event-sourced. Each JSON line is one event object.
 - `run.paused`
 - `run.resumed`
 - `run.restarted`
+- `guardrail.breached`
 
 `stream.chunk.data`:
 - `seq`
@@ -75,6 +77,14 @@ AgentBus protocol is event-sourced. Each JSON line is one event object.
 - `severity`
 - `source` (`agent` or `human`)
 - `ts_request`
+
+`guardrail.breached.data`:
+- `scope` (`run`, `task`, `chain`)
+- `rule` (`run_timeout`, `pause_timeout`, `max_nudges`, `max_restarts`, `max_failures`, `max_handoffs`, `no_progress_signature`)
+- `observed`
+- `threshold`
+- `action` (`escalate_pause_chain`)
+- `detail`
 
 ## Structured Action Envelope
 

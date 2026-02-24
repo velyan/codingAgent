@@ -34,10 +34,11 @@ agentbus steer --log-file /tmp/agentbus.jsonl --run-id <id> --action resume --me
 
 ## Incident Playbook
 
-1. `escalation.raised` appears in status/tail.
-2. Inspect associated `run_id` and `task_id` stream history.
-3. Post targeted `steer` or `post-task` for remediation.
-4. Resume with explicit reviewer/executor actions.
+1. `guardrail.breached` and `escalation.raised` appear in status/tail.
+2. Inspect `data.rule`, `data.observed`, and associated `run_id` / `task_id`.
+3. Review stream/task transcript to identify whether timeout, repeated failures, or loop caps were hit.
+4. Post targeted `steer` or `post-task` for remediation.
+5. Resume via explicit reviewer/executor actions once safe.
 
 ## Compaction
 

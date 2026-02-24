@@ -55,3 +55,5 @@ sequenceDiagram
 - Lease expiration enables recovery from crashed agents.
 - Duplicate task suppression via task fingerprint checks.
 - Rework/failure/handoff budgets enforce bounded autonomy.
+- Runtime guardrails enforce hard bounds on run time, pause duration, and nudge/restart loops.
+- Any guardrail breach emits `guardrail.breached` and `escalation.raised`, pausing the chain.

@@ -8,6 +8,7 @@ It supports:
 - Live reviewer supervision over executor stream output.
 - Mid-run steering controls (`nudge`, `pause`, `stop`, `rework`, `resume`).
 - Deterministic control arbitration (`stop > pause > rework > nudge > resume`, then latest).
+- Bounded autonomy guardrails (run timeout, pause timeout, restart/nudge caps, failure/handoff budgets).
 
 ## Why AgentBus
 
@@ -43,6 +44,11 @@ agentbus run \
   --backend codex \
   --role executor \
   --cwd /path/to/repo \
+  --run-timeout-seconds 1800 \
+  --pause-timeout-seconds 900 \
+  --max-nudges-per-run 3 \
+  --max-restarts-per-run 6 \
+  --max-identical-failures 3 \
   --autonomous
 ```
 
@@ -113,6 +119,16 @@ Supported actions:
 - `steer`
 
 Invalid actions are rejected and logged as `action.rejected` or `reviewer.control.rejected`.
+
+## Guardrail Defaults
+
+- `run_timeout_seconds=1800`
+- `pause_timeout_seconds=900`
+- `max_nudges_per_run=3`
+- `max_restarts_per_run=6`
+- `max_identical_failures=3`
+
+Guardrail breaches emit `guardrail.breached` and then `escalation.raised`, pausing the chain until explicit recovery actions.
 
 ## Architecture and Protocol
 

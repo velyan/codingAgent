@@ -5,7 +5,7 @@ import subprocess
 import time
 from datetime import timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from uuid import uuid4
 
 from agentbus.actions import parse_agentbus_actions
@@ -17,6 +17,7 @@ from agentbus.models import (
     ControlRequestView,
     CONTROL_SEVERITY,
     ESCALATION_RAISED,
+    GUARDRAIL_BREACHED,
     OBJECTIVE_CREATED,
     REVIEWER_CONTROL_APPLIED,
     REVIEWER_CONTROL_REJECTED,
@@ -89,6 +90,79 @@ def _append_events(store: JsonlEventStore, events: list[dict[str, Any]]) -> None
         store.append_many(events)
 
 
+def _build_guardrail_payload(
+    *,
+    scope: str,
+    rule: str,
+    observed: Any,
+    threshold: Any,
+    detail: str,
+) -> dict[str, Any]:
+    return {
+        "scope": scope,
+        "rule": rule,
+        "observed": observed,
+        "threshold": threshold,
+        "action": "escalate_pause_chain",
+        "detail": detail,
+    }
+
+
+def _emit_escalation(
+    *,
+    append_events: Callable[[list[dict[str, Any]]], None],
+    config: RunConfig,
+    actor: Actor,
+    chain_id: str,
+    task_id: str | None,
+    run_id: str | None,
+    reason: str,
+    guardrail_payload: dict[str, Any] | None = None,
+) -> None:
+    events: list[dict[str, Any]] = []
+    if guardrail_payload is not None:
+        events.append(
+            make_event(
+                kind=GUARDRAIL_BREACHED,
+                actor=actor,
+                chain_id=chain_id,
+                task_id=task_id,
+                run_id=run_id,
+                data=guardrail_payload,
+            )
+        )
+    events.append(
+        make_event(
+            kind=ESCALATION_RAISED,
+            actor=actor,
+            chain_id=chain_id,
+            task_id=task_id,
+            run_id=run_id,
+            data={"reason": reason},
+        )
+    )
+    append_events(events)
+    _maybe_emit_escalation_file(
+        config,
+        (
+            f"chain_id={chain_id} task_id={task_id or '-'} run_id={run_id or '-'} "
+            f"reason={reason}"
+        ),
+    )
+
+
+def _has_repeated_failure_signature(signatures: list[str], repeat_count: int) -> bool:
+    if repeat_count <= 0:
+        return False
+    if len(signatures) < repeat_count:
+        return False
+    tail = signatures[-repeat_count:]
+    first = tail[0].strip()
+    if not first:
+        return False
+    return all(item.strip() == first for item in tail)
+
+
 def _task_created_event(
     *,
     actor: Actor,
@@ -125,6 +199,7 @@ def _task_created_event(
 
 def _claim_next_task(store: JsonlEventStore, *, config: RunConfig) -> tuple[TaskView, str] | None:
     now = utc_now()
+    actor = Actor(type="agent", id=config.agent_id, backend=config.backend)
     with store.locked() as locked:
         events = locked.read_events()
         state = reduce_events(events)
@@ -139,10 +214,49 @@ def _claim_next_task(store: JsonlEventStore, *, config: RunConfig) -> tuple[Task
             return None
 
         task = candidates[0]
+        chain_view = state.chains.get(task.chain_id)
+        if chain_view is not None:
+            if chain_view.failure_count >= task.budgets.max_failures:
+                _emit_escalation(
+                    append_events=locked.append_events,
+                    config=config,
+                    actor=actor,
+                    chain_id=task.chain_id,
+                    task_id=task.task_id,
+                    run_id=task.run_id,
+                    reason="max_failures exceeded",
+                    guardrail_payload=_build_guardrail_payload(
+                        scope="chain",
+                        rule="max_failures",
+                        observed=chain_view.failure_count,
+                        threshold=task.budgets.max_failures,
+                        detail="failure budget exceeded before claim",
+                    ),
+                )
+                return None
+            if _has_repeated_failure_signature(chain_view.recent_failure_signatures, config.max_identical_failures):
+                _emit_escalation(
+                    append_events=locked.append_events,
+                    config=config,
+                    actor=actor,
+                    chain_id=task.chain_id,
+                    task_id=task.task_id,
+                    run_id=task.run_id,
+                    reason="repeated identical failure signature",
+                    guardrail_payload=_build_guardrail_payload(
+                        scope="chain",
+                        rule="no_progress_signature",
+                        observed=config.max_identical_failures,
+                        threshold=config.max_identical_failures,
+                        detail="no progress detected from repeated failure signature",
+                    ),
+                )
+                return None
+
         run_id = str(uuid4())
         claim_event = make_event(
             kind=TASK_CLAIMED,
-            actor=Actor(type="agent", id=config.agent_id, backend=config.backend),
+            actor=actor,
             task_id=task.task_id,
             chain_id=task.chain_id,
             run_id=run_id,
@@ -269,8 +383,41 @@ def _apply_actions(
     with store.locked() as locked:
         existing_state = reduce_events(locked.read_events())
         fingerprints = pending_task_fingerprints(existing_state, task.chain_id)
+        chain_view = existing_state.chains.get(task.chain_id)
+        handoff_breach_emitted = False
         for action in result.actions:
             if action.type == "create_task":
+                if chain_view is not None and chain_view.handoff_count >= task.budgets.max_handoffs:
+                    events.append(
+                        make_event(
+                            kind=ACTION_REJECTED,
+                            actor=actor,
+                            chain_id=task.chain_id,
+                            task_id=task.task_id,
+                            run_id=run_id,
+                            data={"reason": "max_handoffs exceeded"},
+                        )
+                    )
+                    if not handoff_breach_emitted:
+                        _emit_escalation(
+                            append_events=events.extend,
+                            config=config,
+                            actor=actor,
+                            chain_id=task.chain_id,
+                            task_id=task.task_id,
+                            run_id=run_id,
+                            reason="max_handoffs exceeded",
+                            guardrail_payload=_build_guardrail_payload(
+                                scope="chain",
+                                rule="max_handoffs",
+                                observed=chain_view.handoff_count,
+                                threshold=task.budgets.max_handoffs,
+                                detail="handoff budget exceeded during task creation",
+                            ),
+                        )
+                        handoff_breach_emitted = True
+                    continue
+
                 payload = action.payload
                 new_targets = TaskTargets(backends=payload.get("target_backend", []), agent_ids=[])
                 new_quality = QualityGate(
@@ -324,6 +471,8 @@ def _apply_actions(
                     )
                 )
                 fingerprints.add(fingerprint)
+                if chain_view is not None:
+                    chain_view.handoff_count += 1
 
             elif action.type == "request_rework":
                 events.append(
@@ -350,15 +499,14 @@ def _apply_actions(
                 )
 
             elif action.type == "raise_escalation":
-                events.append(
-                    make_event(
-                        kind=ESCALATION_RAISED,
-                        actor=actor,
-                        chain_id=task.chain_id,
-                        task_id=task.task_id,
-                        run_id=run_id,
-                        data={"reason": action.payload.get("reason", "")},
-                    )
+                _emit_escalation(
+                    append_events=events.extend,
+                    config=config,
+                    actor=actor,
+                    chain_id=task.chain_id,
+                    task_id=task.task_id,
+                    run_id=run_id,
+                    reason=str(action.payload.get("reason", "")),
                 )
 
             elif action.type == "steer":
@@ -419,6 +567,10 @@ def _execute_worker_task(
     seq = 0
     pending_pause = False
     paused_note = ""
+    run_started_monotonic = time.monotonic()
+    nudge_count = 0
+    restart_count = 0
+    run_timeout_triggered = False
 
     while True:
         started_event = make_event(
@@ -470,8 +622,17 @@ def _execute_worker_task(
         def on_tick(proc: subprocess.Popen[bytes]) -> None:
             nonlocal chosen_control_id, chosen_control_action, chosen_control_message
             nonlocal last_heartbeat, last_control_check
+            nonlocal run_timeout_triggered
 
             now_monotonic = time.monotonic()
+            elapsed = now_monotonic - run_started_monotonic
+            if elapsed >= config.run_timeout_seconds and not run_timeout_triggered:
+                run_timeout_triggered = True
+                chosen_control_action = "guardrail_run_timeout"
+                chosen_control_message = f"run timeout exceeded ({config.run_timeout_seconds}s)"
+                _interrupt_process(proc)
+                return
+
             if now_monotonic - last_heartbeat >= config.heartbeat_seconds:
                 lease_event = make_event(
                     kind=TASK_HEARTBEAT,
@@ -564,7 +725,123 @@ def _execute_worker_task(
         resume_mode = True
 
         # Handle control actions after process exits.
+        if run_timeout_triggered:
+            fail_event = make_event(
+                kind=TASK_FAILED,
+                actor=actor,
+                task_id=task.task_id,
+                chain_id=task.chain_id,
+                run_id=run_id,
+                data={
+                    "exit_code": run_result.exit_code,
+                    "duration_ms": run_result.duration_ms,
+                    "stdout": stdout_clipped,
+                    "stderr": stderr_clipped,
+                    "final_output": final_clipped,
+                    "error": "run timeout exceeded",
+                    "error_signature": _error_signature(run_result.stdout, run_result.stderr),
+                    "backend": config.backend,
+                },
+            )
+            _append_events(store, [fail_event])
+            _emit_escalation(
+                append_events=store.append_many,
+                config=config,
+                actor=actor,
+                chain_id=task.chain_id,
+                task_id=task.task_id,
+                run_id=run_id,
+                reason="run timeout exceeded",
+                guardrail_payload=_build_guardrail_payload(
+                    scope="run",
+                    rule="run_timeout",
+                    observed=int(time.monotonic() - run_started_monotonic),
+                    threshold=config.run_timeout_seconds,
+                    detail="run wall clock timeout reached",
+                ),
+            )
+            store.save_agent_state(config.agent_id, agent_state)
+            return
+
         if chosen_control_action == "nudge":
+            nudge_count += 1
+            if nudge_count > config.max_nudges_per_run:
+                fail_event = make_event(
+                    kind=TASK_FAILED,
+                    actor=actor,
+                    task_id=task.task_id,
+                    chain_id=task.chain_id,
+                    run_id=run_id,
+                    data={
+                        "exit_code": run_result.exit_code,
+                        "duration_ms": run_result.duration_ms,
+                        "stdout": stdout_clipped,
+                        "stderr": stderr_clipped,
+                        "final_output": final_clipped,
+                        "error": "max nudges exceeded",
+                        "error_signature": _error_signature(run_result.stdout, run_result.stderr),
+                        "backend": config.backend,
+                    },
+                )
+                _append_events(store, [fail_event])
+                _emit_escalation(
+                    append_events=store.append_many,
+                    config=config,
+                    actor=actor,
+                    chain_id=task.chain_id,
+                    task_id=task.task_id,
+                    run_id=run_id,
+                    reason="max_nudges exceeded",
+                    guardrail_payload=_build_guardrail_payload(
+                        scope="run",
+                        rule="max_nudges",
+                        observed=nudge_count,
+                        threshold=config.max_nudges_per_run,
+                        detail="nudge limit exceeded for run",
+                    ),
+                )
+                store.save_agent_state(config.agent_id, agent_state)
+                return
+
+            proposed_restart_count = restart_count + 1
+            if proposed_restart_count > config.max_restarts_per_run:
+                fail_event = make_event(
+                    kind=TASK_FAILED,
+                    actor=actor,
+                    task_id=task.task_id,
+                    chain_id=task.chain_id,
+                    run_id=run_id,
+                    data={
+                        "exit_code": run_result.exit_code,
+                        "duration_ms": run_result.duration_ms,
+                        "stdout": stdout_clipped,
+                        "stderr": stderr_clipped,
+                        "final_output": final_clipped,
+                        "error": "max restarts exceeded",
+                        "error_signature": _error_signature(run_result.stdout, run_result.stderr),
+                        "backend": config.backend,
+                    },
+                )
+                _append_events(store, [fail_event])
+                _emit_escalation(
+                    append_events=store.append_many,
+                    config=config,
+                    actor=actor,
+                    chain_id=task.chain_id,
+                    task_id=task.task_id,
+                    run_id=run_id,
+                    reason="max_restarts exceeded",
+                    guardrail_payload=_build_guardrail_payload(
+                        scope="run",
+                        rule="max_restarts",
+                        observed=proposed_restart_count,
+                        threshold=config.max_restarts_per_run,
+                        detail="restart limit exceeded for run",
+                    ),
+                )
+                store.save_agent_state(config.agent_id, agent_state)
+                return
+
             store.append(
                 make_event(
                     kind=RUN_INTERRUPTED,
@@ -589,6 +866,7 @@ def _execute_worker_task(
                     data={"reason": "nudge"},
                 )
             )
+            restart_count = proposed_restart_count
             continue
 
         if chosen_control_action == "pause":
@@ -623,15 +901,16 @@ def _execute_worker_task(
                     "backend": config.backend,
                 },
             )
-            escalation = make_event(
-                kind=ESCALATION_RAISED,
+            _append_events(store, [fail_event])
+            _emit_escalation(
+                append_events=store.append_many,
+                config=config,
                 actor=actor,
-                task_id=task.task_id,
                 chain_id=task.chain_id,
+                task_id=task.task_id,
                 run_id=run_id,
-                data={"reason": chosen_control_message or "run stopped"},
+                reason=chosen_control_message or "run stopped",
             )
-            _append_events(store, [fail_event, escalation])
             store.save_agent_state(config.agent_id, agent_state)
             return
 
@@ -646,14 +925,6 @@ def _execute_worker_task(
             )
 
             if task.attempt >= task.budgets.max_reworks + 1:
-                escalation = make_event(
-                    kind=ESCALATION_RAISED,
-                    actor=actor,
-                    task_id=task.task_id,
-                    chain_id=task.chain_id,
-                    run_id=run_id,
-                    data={"reason": "rework budget exceeded"},
-                )
                 fail_event = make_event(
                     kind=TASK_FAILED,
                     actor=actor,
@@ -671,7 +942,16 @@ def _execute_worker_task(
                         "backend": config.backend,
                     },
                 )
-                _append_events(store, [requested, fail_event, escalation])
+                _append_events(store, [requested, fail_event])
+                _emit_escalation(
+                    append_events=store.append_many,
+                    config=config,
+                    actor=actor,
+                    chain_id=task.chain_id,
+                    task_id=task.task_id,
+                    run_id=run_id,
+                    reason="rework budget exceeded",
+                )
                 store.save_agent_state(config.agent_id, agent_state)
                 return
 
@@ -713,9 +993,49 @@ def _execute_worker_task(
 
         if pending_pause:
             pause_last_heartbeat = time.monotonic()
+            pause_started_monotonic = time.monotonic()
             while True:
                 time.sleep(max(0.2, config.poll_seconds))
                 now_monotonic = time.monotonic()
+                paused_duration = now_monotonic - pause_started_monotonic
+                if paused_duration >= config.pause_timeout_seconds:
+                    fail_event = make_event(
+                        kind=TASK_FAILED,
+                        actor=actor,
+                        task_id=task.task_id,
+                        chain_id=task.chain_id,
+                        run_id=run_id,
+                        data={
+                            "exit_code": run_result.exit_code,
+                            "duration_ms": run_result.duration_ms,
+                            "stdout": stdout_clipped,
+                            "stderr": stderr_clipped,
+                            "final_output": final_clipped,
+                            "error": "pause timeout exceeded",
+                            "error_signature": _error_signature(run_result.stdout, run_result.stderr),
+                            "backend": config.backend,
+                        },
+                    )
+                    _append_events(store, [fail_event])
+                    _emit_escalation(
+                        append_events=store.append_many,
+                        config=config,
+                        actor=actor,
+                        chain_id=task.chain_id,
+                        task_id=task.task_id,
+                        run_id=run_id,
+                        reason="pause timeout exceeded",
+                        guardrail_payload=_build_guardrail_payload(
+                            scope="run",
+                            rule="pause_timeout",
+                            observed=int(paused_duration),
+                            threshold=config.pause_timeout_seconds,
+                            detail="run remained paused past timeout",
+                        ),
+                    )
+                    store.save_agent_state(config.agent_id, agent_state)
+                    return
+
                 if now_monotonic - pause_last_heartbeat >= config.heartbeat_seconds:
                     store.append(
                         make_event(
@@ -751,6 +1071,45 @@ def _execute_worker_task(
                     continue
 
                 if control.action == "resume":
+                    proposed_restart_count = restart_count + 1
+                    if proposed_restart_count > config.max_restarts_per_run:
+                        fail_event = make_event(
+                            kind=TASK_FAILED,
+                            actor=actor,
+                            task_id=task.task_id,
+                            chain_id=task.chain_id,
+                            run_id=run_id,
+                            data={
+                                "exit_code": run_result.exit_code,
+                                "duration_ms": run_result.duration_ms,
+                                "stdout": stdout_clipped,
+                                "stderr": stderr_clipped,
+                                "final_output": final_clipped,
+                                "error": "max restarts exceeded",
+                                "error_signature": _error_signature(run_result.stdout, run_result.stderr),
+                                "backend": config.backend,
+                            },
+                        )
+                        _append_events(store, [fail_event])
+                        _emit_escalation(
+                            append_events=store.append_many,
+                            config=config,
+                            actor=actor,
+                            chain_id=task.chain_id,
+                            task_id=task.task_id,
+                            run_id=run_id,
+                            reason="max_restarts exceeded",
+                            guardrail_payload=_build_guardrail_payload(
+                                scope="run",
+                                rule="max_restarts",
+                                observed=proposed_restart_count,
+                                threshold=config.max_restarts_per_run,
+                                detail="restart limit exceeded while paused",
+                            ),
+                        )
+                        store.save_agent_state(config.agent_id, agent_state)
+                        return
+
                     store.append(
                         make_event(
                             kind=REVIEWER_CONTROL_APPLIED,
@@ -813,15 +1172,16 @@ def _execute_worker_task(
                             "backend": config.backend,
                         },
                     )
-                    escalation = make_event(
-                        kind=ESCALATION_RAISED,
+                    _append_events(store, [fail_event])
+                    _emit_escalation(
+                        append_events=store.append_many,
+                        config=config,
                         actor=actor,
-                        task_id=task.task_id,
                         chain_id=task.chain_id,
+                        task_id=task.task_id,
                         run_id=run_id,
-                        data={"reason": control.message or "stopped while paused"},
+                        reason=control.message or "stopped while paused",
                     )
-                    _append_events(store, [fail_event, escalation])
                     store.save_agent_state(config.agent_id, agent_state)
                     return
 
@@ -879,14 +1239,6 @@ def _execute_worker_task(
                         data={"reason": control.message or "rework requested while paused"},
                     )
                     if task.attempt >= task.budgets.max_reworks + 1:
-                        escalation = make_event(
-                            kind=ESCALATION_RAISED,
-                            actor=actor,
-                            task_id=task.task_id,
-                            chain_id=task.chain_id,
-                            run_id=run_id,
-                            data={"reason": "rework budget exceeded"},
-                        )
                         fail_event = make_event(
                             kind=TASK_FAILED,
                             actor=actor,
@@ -904,7 +1256,16 @@ def _execute_worker_task(
                                 "backend": config.backend,
                             },
                         )
-                        _append_events(store, [requested, fail_event, escalation])
+                        _append_events(store, [requested, fail_event])
+                        _emit_escalation(
+                            append_events=store.append_many,
+                            config=config,
+                            actor=actor,
+                            chain_id=task.chain_id,
+                            task_id=task.task_id,
+                            run_id=run_id,
+                            reason="rework budget exceeded",
+                        )
                         store.save_agent_state(config.agent_id, agent_state)
                         return
 
@@ -967,6 +1328,7 @@ def _execute_worker_task(
                     data={"reason": "resume"},
                 )
             )
+            restart_count += 1
             continue
 
         if run_result.exit_code == 0:
