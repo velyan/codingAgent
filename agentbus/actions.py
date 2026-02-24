@@ -28,7 +28,48 @@ class ActionValidationError(ValueError):
 
 def _extract_json_payloads(text: str) -> list[dict[str, Any]]:
     payloads: list[dict[str, Any]] = []
+    seen: set[str] = set()
 
+    def _push(obj: dict[str, Any]) -> None:
+        try:
+            signature = json.dumps(obj, sort_keys=True, ensure_ascii=True)
+        except (TypeError, ValueError):
+            signature = repr(obj)
+        if signature in seen:
+            return
+        seen.add(signature)
+        payloads.append(obj)
+
+    def _walk(value: Any) -> None:
+        if isinstance(value, dict):
+            _push(value)
+            for nested in value.values():
+                _walk(nested)
+            return
+        if isinstance(value, list):
+            for nested in value:
+                _walk(nested)
+            return
+        if isinstance(value, str):
+            for match in _JSON_FENCE_RE.finditer(value):
+                raw = match.group(1)
+                try:
+                    obj = json.loads(raw)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(obj, dict):
+                    _walk(obj)
+
+            stripped = value.strip()
+            if stripped.startswith("{") and stripped.endswith("}"):
+                try:
+                    obj = json.loads(stripped)
+                except json.JSONDecodeError:
+                    obj = None
+                if isinstance(obj, dict):
+                    _walk(obj)
+
+    # Parse JSON code fences from the full text.
     for match in _JSON_FENCE_RE.finditer(text):
         raw = match.group(1)
         try:
@@ -36,8 +77,9 @@ def _extract_json_payloads(text: str) -> list[dict[str, Any]]:
         except json.JSONDecodeError:
             continue
         if isinstance(obj, dict):
-            payloads.append(obj)
+            _walk(obj)
 
+    # Parse full output as a single JSON object when applicable.
     stripped = text.strip()
     if stripped.startswith("{") and stripped.endswith("}"):
         try:
@@ -45,7 +87,21 @@ def _extract_json_payloads(text: str) -> list[dict[str, Any]]:
         except json.JSONDecodeError:
             obj = None
         if isinstance(obj, dict):
-            payloads.append(obj)
+            _walk(obj)
+
+    # Parse JSONL / stream-json style line envelopes.
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if not (line.startswith("{") and line.endswith("}")):
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(obj, dict):
+            _walk(obj)
 
     return payloads
 

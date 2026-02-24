@@ -28,9 +28,11 @@ class _Completed:
 
 def test_reviewer_model_actions_parses_steer(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setattr(runner, "get_adapter", lambda _backend: _FakeAdapter())
+    called_argv = []
 
     def _fake_run(argv, cwd, env, capture_output, text, timeout):
-        del argv, cwd, env, capture_output, text, timeout
+        called_argv.extend(argv)
+        del cwd, env, capture_output, text, timeout
         return _Completed(
             '{"agentbus_actions":[{"type":"steer","run_id":"run-1","action":"pause","message":"hold"}]}'
         )
@@ -59,6 +61,8 @@ def test_reviewer_model_actions_parses_steer(monkeypatch, tmp_path: Path) -> Non
     assert actions == [("pause", "hold")]
     assert not rejected
     assert state.backend_state.get("reviewed") is True
+    assert "--permission-mode" in called_argv
+    assert "plan" in called_argv
 
 
 def test_reviewer_model_actions_rejects_wrong_run(monkeypatch, tmp_path: Path) -> None:
@@ -91,3 +95,17 @@ def test_reviewer_model_actions_rejects_wrong_run(monkeypatch, tmp_path: Path) -
 
     assert not actions
     assert any("run_id mismatch" in reason for reason in rejected)
+
+
+def test_enforce_reviewer_readonly_command_flags() -> None:
+    codex = runner._enforce_reviewer_readonly_command("codex", ["codex", "exec", "--json", "prompt"])
+    assert "--sandbox" in codex
+    assert "read-only" in codex
+
+    claude = runner._enforce_reviewer_readonly_command("claude", ["claude", "-p", "prompt"])
+    assert "--permission-mode" in claude
+    assert "plan" in claude
+
+    cursor = runner._enforce_reviewer_readonly_command("cursor", ["cursor-agent", "-p", "prompt"])
+    assert "--mode" in cursor
+    assert "plan" in cursor

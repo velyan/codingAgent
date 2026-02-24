@@ -14,6 +14,7 @@ from agentbus.events import make_event
 from agentbus.models import (
     ACTION_REJECTED,
     CHAIN_COMPLETED,
+    ControlRequestView,
     CONTROL_SEVERITY,
     ESCALATION_RAISED,
     OBJECTIVE_CREATED,
@@ -43,6 +44,7 @@ from agentbus.models import (
     RunConfig,
     TaskTargets,
     TaskView,
+    RunView,
     format_ts,
     utc_now,
 )
@@ -203,6 +205,38 @@ def _emit_control_rejected(
         data=payload,
     )
     store.append(event)
+
+
+def _authorize_control(*, run_view: RunView | None, control: ControlRequestView) -> tuple[bool, str]:
+    if control.source == "human":
+        return True, ""
+    if run_view is None:
+        return False, "control requires active run"
+    if not run_view.reviewer_agent_id:
+        return False, "control requires active reviewer supervision"
+    if control.actor_id != run_view.reviewer_agent_id:
+        return False, "control from non-owner reviewer"
+    return True, ""
+
+
+def _insert_flag_before_prompt(argv: list[str], flag: str, value: str, aliases: tuple[str, ...] = ()) -> list[str]:
+    all_flags = (flag,) + aliases
+    if any(existing in argv for existing in all_flags):
+        return list(argv)
+    result = list(argv)
+    insert_at = max(0, len(result) - 1)
+    result[insert_at:insert_at] = [flag, value]
+    return result
+
+
+def _enforce_reviewer_readonly_command(backend: str, argv: list[str]) -> list[str]:
+    if backend == "codex":
+        return _insert_flag_before_prompt(argv, "--sandbox", "read-only", aliases=("-s",))
+    if backend == "claude":
+        return _insert_flag_before_prompt(argv, "--permission-mode", "plan")
+    if backend == "cursor":
+        return _insert_flag_before_prompt(argv, "--mode", "plan")
+    return list(argv)
 
 
 def _apply_actions(
@@ -464,19 +498,19 @@ def _execute_worker_task(
                 return
 
             run_view = state.runs.get(run_id)
-            if run_view is not None and run_view.reviewer_agent_id:
-                if control.actor_id != run_view.reviewer_agent_id and control.source != "human":
-                    _emit_control_rejected(
-                        store=store,
-                        config=config,
-                        chain_id=task.chain_id,
-                        task_id=task.task_id,
-                        run_id=run_id,
-                        reason="control from non-owner reviewer",
-                        rejected_event_id=control.event_id,
-                        rejected_action=control.action,
-                    )
-                    return
+            authorized, reason = _authorize_control(run_view=run_view, control=control)
+            if not authorized:
+                _emit_control_rejected(
+                    store=store,
+                    config=config,
+                    chain_id=task.chain_id,
+                    task_id=task.task_id,
+                    run_id=run_id,
+                    reason=reason,
+                    rejected_event_id=control.event_id,
+                    rejected_action=control.action,
+                )
+                return
 
             if control.action == "resume":
                 _emit_control_rejected(
@@ -702,19 +736,19 @@ def _execute_worker_task(
                 if control is None:
                     continue
                 run_view = state.runs.get(run_id)
-                if run_view is not None and run_view.reviewer_agent_id:
-                    if control.actor_id != run_view.reviewer_agent_id and control.source != "human":
-                        _emit_control_rejected(
-                            store=store,
-                            config=config,
-                            chain_id=task.chain_id,
-                            task_id=task.task_id,
-                            run_id=run_id,
-                            reason="control from non-owner reviewer",
-                            rejected_event_id=control.event_id,
-                            rejected_action=control.action,
-                        )
-                        continue
+                authorized, reason = _authorize_control(run_view=run_view, control=control)
+                if not authorized:
+                    _emit_control_rejected(
+                        store=store,
+                        config=config,
+                        chain_id=task.chain_id,
+                        task_id=task.task_id,
+                        run_id=run_id,
+                        reason=reason,
+                        rejected_event_id=control.event_id,
+                        rejected_action=control.action,
+                    )
+                    continue
 
                 if control.action == "resume":
                     store.append(
@@ -1057,10 +1091,11 @@ def _reviewer_model_actions(
         agent_state=agent_state,
         resume=True,
     )
+    safe_argv = _enforce_reviewer_readonly_command(config.backend, command.argv)
 
     try:
         completed = subprocess.run(
-            command.argv,
+            safe_argv,
             cwd=config.cwd,
             env=command.env,
             capture_output=True,
