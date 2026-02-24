@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -11,12 +12,20 @@ import fcntl
 from agentbus.models import AgentState
 
 
+@dataclass
+class EventCursor:
+    line_no: int = 0
+
+
 class LockedStore:
     def __init__(self, parent: "JsonlEventStore") -> None:
         self._parent = parent
 
     def read_events(self) -> list[dict[str, Any]]:
         return self._parent._read_events_unlocked()
+
+    def read_events_from(self, cursor: EventCursor) -> tuple[list[dict[str, Any]], EventCursor]:
+        return self._parent._read_events_from_unlocked(cursor)
 
     def append_events(self, events: list[dict[str, Any]]) -> None:
         self._parent._append_events_unlocked(events)
@@ -46,6 +55,10 @@ class JsonlEventStore:
         with self.locked() as locked:
             return locked.read_events()
 
+    def read_from(self, cursor: EventCursor) -> tuple[list[dict[str, Any]], EventCursor]:
+        with self.locked() as locked:
+            return locked.read_events_from(cursor)
+
     def append(self, event: dict[str, Any]) -> None:
         self.append_many([event])
 
@@ -56,23 +69,32 @@ class JsonlEventStore:
             locked.append_events(events)
 
     def _read_events_unlocked(self) -> list[dict[str, Any]]:
+        events, _ = self._read_events_from_unlocked(EventCursor(line_no=0))
+        return events
+
+    def _read_events_from_unlocked(self, cursor: EventCursor) -> tuple[list[dict[str, Any]], EventCursor]:
         events: list[dict[str, Any]] = []
+        line_no = 0
         if not self.log_path.exists():
-            return events
+            return events, cursor
+
         with self.log_path.open("r", encoding="utf-8") as handle:
             for line_no, raw_line in enumerate(handle, start=1):
+                if line_no <= cursor.line_no:
+                    continue
                 line = raw_line.strip()
                 if not line:
                     continue
                 try:
                     event = json.loads(line)
                 except json.JSONDecodeError:
-                    # Keep the log readable even if a line is corrupted.
                     continue
                 if isinstance(event, dict):
                     event["_line_no"] = line_no
                     events.append(event)
-        return events
+
+        next_cursor = EventCursor(line_no=max(cursor.line_no, line_no))
+        return events, next_cursor
 
     def _append_events_unlocked(self, events: list[dict[str, Any]]) -> None:
         with self.log_path.open("a", encoding="utf-8") as handle:
@@ -94,12 +116,19 @@ class JsonlEventStore:
             payload = json.loads(path.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError):
             return AgentState()
+
         backend_state = payload.get("backend_state")
         if not isinstance(backend_state, dict):
             backend_state = {}
-        return AgentState(backend_state=backend_state)
+        supervisor_state = payload.get("supervisor_state")
+        if not isinstance(supervisor_state, dict):
+            supervisor_state = {}
+        return AgentState(backend_state=backend_state, supervisor_state=supervisor_state)
 
     def save_agent_state(self, agent_id: str, state: AgentState) -> None:
         path = self.agent_state_path(agent_id)
-        payload = {"backend_state": state.backend_state}
+        payload = {
+            "backend_state": state.backend_state,
+            "supervisor_state": state.supervisor_state,
+        }
         path.write_text(json.dumps(payload, indent=2, ensure_ascii=True) + "\n", encoding="utf-8")

@@ -7,7 +7,7 @@ name = "agentbus"
 version = "0.1.0"
 description = "Shared-log collaborative execution agents"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.9"
 authors = [{ name = "AgentBus" }]
 dependencies = []
 

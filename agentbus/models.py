@@ -8,9 +8,18 @@ Backend = Literal["codex", "claude", "cursor"]
 Role = Literal["planner", "executor", "reviewer"]
 TaskStatus = Literal["pending", "claimed", "running", "completed", "failed"]
 ReviewMode = Literal["hard", "soft"]
+RunStatus = Literal["running", "paused", "completed", "failed", "interrupted", "stopped"]
+ControlAction = Literal["nudge", "pause", "stop", "rework", "resume"]
 
 SUPPORTED_BACKENDS: tuple[Backend, ...] = ("codex", "claude", "cursor")
 SUPPORTED_ROLES: tuple[Role, ...] = ("planner", "executor", "reviewer")
+SUPPORTED_CONTROL_ACTIONS: tuple[ControlAction, ...] = (
+    "nudge",
+    "pause",
+    "stop",
+    "rework",
+    "resume",
+)
 
 DEFAULT_POLL_SECONDS = 2.0
 DEFAULT_LEASE_SECONDS = 120
@@ -21,6 +30,12 @@ DEFAULT_MAX_REWORKS = 2
 DEFAULT_MAX_FAILURES = 3
 DEFAULT_REVIEW_MODE: ReviewMode = "hard"
 DEFAULT_MAX_OUTPUT_BYTES = 1024 * 1024
+DEFAULT_STREAM_CHUNK_BYTES = 4096
+DEFAULT_STREAM_FLUSH_MS = 250
+DEFAULT_CONTROL_POLL_MS = 500
+DEFAULT_REVIEW_CADENCE_SECONDS = 7.0
+DEFAULT_REVIEWER_LEASE_SECONDS = 60
+DEFAULT_REVIEWER_HEARTBEAT_SECONDS = 10
 
 TASK_CREATED = "task.created"
 TASK_CLAIMED = "task.claimed"
@@ -29,12 +44,24 @@ TASK_HEARTBEAT = "task.heartbeat"
 TASK_COMPLETED = "task.completed"
 TASK_FAILED = "task.failed"
 TASK_REQUEUED = "task.requeued"
+
 OBJECTIVE_CREATED = "objective.created"
 REVIEW_PASSED = "review.passed"
 REVIEW_REWORK_REQUESTED = "review.rework_requested"
 ESCALATION_RAISED = "escalation.raised"
 CHAIN_COMPLETED = "chain.completed"
 ACTION_REJECTED = "action.rejected"
+
+STREAM_CHUNK = "stream.chunk"
+REVIEWER_SUPERVISION_CLAIMED = "reviewer.supervision.claimed"
+REVIEWER_SUPERVISION_HEARTBEAT = "reviewer.supervision.heartbeat"
+REVIEWER_CONTROL_REQUESTED = "reviewer.control.requested"
+REVIEWER_CONTROL_APPLIED = "reviewer.control.applied"
+REVIEWER_CONTROL_REJECTED = "reviewer.control.rejected"
+RUN_INTERRUPTED = "run.interrupted"
+RUN_PAUSED = "run.paused"
+RUN_RESUMED = "run.resumed"
+RUN_RESTARTED = "run.restarted"
 
 TASK_LIFECYCLE_KINDS: set[str] = {
     TASK_CREATED,
@@ -46,8 +73,18 @@ TASK_LIFECYCLE_KINDS: set[str] = {
     TASK_REQUEUED,
 }
 
+ACTIVE_RUN_STATUSES: set[str] = {"running", "paused", "interrupted"}
 
-@dataclass(slots=True)
+CONTROL_SEVERITY: dict[ControlAction, int] = {
+    "resume": 0,
+    "nudge": 1,
+    "rework": 2,
+    "pause": 3,
+    "stop": 4,
+}
+
+
+@dataclass
 class Actor:
     type: Literal["user", "agent", "system"]
     id: str
@@ -57,7 +94,7 @@ class Actor:
         return {"type": self.type, "id": self.id, "backend": self.backend}
 
 
-@dataclass(slots=True)
+@dataclass
 class QualityGate:
     acceptance_criteria: list[str] = field(default_factory=list)
     required_checks: list[str] = field(default_factory=list)
@@ -81,7 +118,7 @@ class QualityGate:
         }
 
 
-@dataclass(slots=True)
+@dataclass
 class Budgets:
     max_handoffs: int = DEFAULT_MAX_HANDOFFS
     max_reworks: int = DEFAULT_MAX_REWORKS
@@ -105,7 +142,7 @@ class Budgets:
         }
 
 
-@dataclass(slots=True)
+@dataclass
 class TaskTargets:
     backends: list[str] = field(default_factory=list)
     agent_ids: list[str] = field(default_factory=list)
@@ -123,7 +160,7 @@ class TaskTargets:
         return {"backends": list(self.backends), "agent_ids": list(self.agent_ids)}
 
 
-@dataclass(slots=True)
+@dataclass
 class TaskView:
     task_id: str
     chain_id: str
@@ -137,6 +174,7 @@ class TaskView:
     targets: TaskTargets
     status: TaskStatus = "pending"
     run_id: str | None = None
+    parent_task_id: str | None = None
     attempt: int = 1
     claimed_by: str | None = None
     claimed_backend: str | None = None
@@ -156,7 +194,7 @@ class TaskView:
         return False
 
 
-@dataclass(slots=True)
+@dataclass
 class ChainView:
     chain_id: str
     objective: str = ""
@@ -171,13 +209,48 @@ class ChainView:
     recent_failure_signatures: list[str] = field(default_factory=list)
 
 
-@dataclass(slots=True)
+@dataclass
+class ControlRequestView:
+    event_id: str
+    run_id: str
+    action: ControlAction
+    message: str
+    severity: int
+    source: Literal["agent", "human"]
+    actor_id: str
+    requested_at: datetime
+
+
+@dataclass
+class RunView:
+    run_id: str
+    task_id: str
+    chain_id: str
+    executor_agent_id: str
+    backend: str
+    status: RunStatus
+    started_at: datetime
+    updated_at: datetime
+    reviewer_agent_id: str | None = None
+    reviewer_lease_expires_at: datetime | None = None
+    completed_at: datetime | None = None
+
+    def is_active(self, now: datetime) -> bool:
+        if self.status not in ACTIVE_RUN_STATUSES:
+            return False
+        return self.completed_at is None
+
+
+@dataclass
 class ReducedState:
     tasks: dict[str, TaskView] = field(default_factory=dict)
     chains: dict[str, ChainView] = field(default_factory=dict)
+    runs: dict[str, RunView] = field(default_factory=dict)
+    pending_controls: dict[str, list[ControlRequestView]] = field(default_factory=dict)
+    applied_control_event_ids: set[str] = field(default_factory=set)
 
 
-@dataclass(slots=True)
+@dataclass
 class ExecutionResult:
     command: list[str]
     stdout: str
@@ -188,7 +261,15 @@ class ExecutionResult:
     session_ref: str | None = None
 
 
-@dataclass(slots=True)
+@dataclass
+class StreamChunk:
+    channel: Literal["stdout", "stderr"]
+    text: str
+    seq: int
+    truncated: bool = False
+
+
+@dataclass
 class RunConfig:
     log_file: str
     agent_id: str
@@ -206,17 +287,24 @@ class RunConfig:
     max_failures: int = DEFAULT_MAX_FAILURES
     max_output_bytes: int = DEFAULT_MAX_OUTPUT_BYTES
     escalation_file: str | None = None
+    stream_chunk_bytes: int = DEFAULT_STREAM_CHUNK_BYTES
+    stream_flush_ms: int = DEFAULT_STREAM_FLUSH_MS
+    control_poll_ms: int = DEFAULT_CONTROL_POLL_MS
+    review_cadence_seconds: float = DEFAULT_REVIEW_CADENCE_SECONDS
+    reviewer_lease_seconds: int = DEFAULT_REVIEWER_LEASE_SECONDS
+    reviewer_heartbeat_seconds: int = DEFAULT_REVIEWER_HEARTBEAT_SECONDS
 
 
-@dataclass(slots=True)
+@dataclass
 class PendingTask:
     task: TaskView
     run_id: str
 
 
-@dataclass(slots=True)
+@dataclass
 class AgentState:
     backend_state: dict[str, Any] = field(default_factory=dict)
+    supervisor_state: dict[str, Any] = field(default_factory=dict)
 
 
 def utc_now() -> datetime:
@@ -224,9 +312,12 @@ def utc_now() -> datetime:
 
 
 def parse_ts(value: str) -> datetime:
-    if value.endswith("Z"):
-        value = value[:-1] + "+00:00"
-    return datetime.fromisoformat(value)
+    normalized = value.strip()
+    if not normalized:
+        return datetime.fromtimestamp(0, tz=timezone.utc)
+    if normalized.endswith("Z"):
+        normalized = normalized[:-1] + "+00:00"
+    return datetime.fromisoformat(normalized)
 
 
 def format_ts(value: datetime) -> str:
