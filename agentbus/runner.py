@@ -1148,7 +1148,9 @@ def _claim_supervision(
         run = state.runs.get(run_id)
         if run is None:
             return False
-        if run.status not in {"running", "paused", "interrupted"}:
+        if run.status not in {"running", "paused", "interrupted", "completed", "failed", "stopped"}:
+            return False
+        if run.status in {"completed", "failed", "stopped"} and run.review_outcome is not None:
             return False
         if run.reviewer_agent_id and run.reviewer_agent_id != config.agent_id:
             if run.reviewer_lease_expires_at and now < run.reviewer_lease_expires_at:
@@ -1231,6 +1233,12 @@ def _reviewer_loop(*, store: JsonlEventStore, config: RunConfig, agent_state: Ag
                 continue
 
             if run.status in {"completed", "failed", "stopped"}:
+                if run.review_outcome is not None:
+                    supervised_run_id = None
+                    stream_buffer = []
+                    last_supervision_heartbeat = 0.0
+                    time.sleep(max(0.2, config.poll_seconds))
+                    continue
                 kind = REVIEW_PASSED if run.status == "completed" else REVIEW_REWORK_REQUESTED
                 store.append(
                     make_event(

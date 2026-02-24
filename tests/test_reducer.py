@@ -2,6 +2,7 @@ from datetime import timedelta
 
 from agentbus.events import make_event
 from agentbus.models import (
+    REVIEW_PASSED,
     REVIEWER_CONTROL_APPLIED,
     REVIEWER_CONTROL_REJECTED,
     REVIEWER_CONTROL_REQUESTED,
@@ -9,6 +10,7 @@ from agentbus.models import (
     REVIEWER_SUPERVISION_HEARTBEAT,
     RUN_PAUSED,
     TASK_CLAIMED,
+    TASK_COMPLETED,
     TASK_CREATED,
     TASK_STARTED,
     Actor,
@@ -235,3 +237,129 @@ def test_non_owner_supervision_heartbeat_is_ignored() -> None:
     run = state.runs["run1"]
     assert run.reviewer_agent_id == "rev1"
     assert format_ts(run.reviewer_lease_expires_at) == format_ts(initial_lease)
+
+
+def test_terminal_unreviewed_run_is_supervisable_after_lease_expiry() -> None:
+    now = utc_now()
+    actor_user = Actor(type="user", id="u1")
+    actor_exec = Actor(type="agent", id="exec1", backend="codex")
+    stale_lease = now - timedelta(seconds=10)
+
+    events = [
+        make_event(
+            kind=TASK_CREATED,
+            actor=actor_user,
+            task_id="t2",
+            chain_id="c2",
+            data={
+                "prompt": "do thing",
+                "role_target": "executor",
+                "stage": "execution",
+                "priority": 100,
+                "quality_gate": {"acceptance_criteria": [], "required_checks": [], "review_mode": "hard"},
+                "budgets": {"max_handoffs": 8, "max_reworks": 2, "max_failures": 3},
+                "targets": {"backends": ["codex"], "agent_ids": []},
+                "attempt": 1,
+            },
+        ),
+        make_event(
+            kind=TASK_CLAIMED,
+            actor=actor_exec,
+            task_id="t2",
+            chain_id="c2",
+            run_id="run2",
+            data={"agent_id": "exec1", "backend": "codex", "lease_expires_at": format_ts(now + timedelta(seconds=30))},
+        ),
+        make_event(
+            kind=TASK_STARTED,
+            actor=actor_exec,
+            task_id="t2",
+            chain_id="c2",
+            run_id="run2",
+            data={"executor_agent_id": "exec1", "backend": "codex"},
+        ),
+        make_event(
+            kind=REVIEWER_SUPERVISION_CLAIMED,
+            actor=Actor(type="agent", id="rev-stale", backend="claude"),
+            task_id="t2",
+            chain_id="c2",
+            run_id="run2",
+            data={"reviewer_agent_id": "rev-stale", "lease_expires_at": format_ts(stale_lease)},
+        ),
+        make_event(
+            kind=TASK_COMPLETED,
+            actor=actor_exec,
+            task_id="t2",
+            chain_id="c2",
+            run_id="run2",
+            data={"exit_code": 0, "duration_ms": 100, "stdout": "", "stderr": "", "final_output": "", "backend": "codex"},
+        ),
+    ]
+
+    state = reduce_events(events)
+    candidates = list_supervisable_runs(state, now=now, reviewer_agent_id="rev-new")
+    assert any(run.run_id == "run2" for run in candidates)
+
+
+def test_terminal_run_is_not_supervisable_after_review_outcome() -> None:
+    now = utc_now()
+    actor_user = Actor(type="user", id="u1")
+    actor_exec = Actor(type="agent", id="exec1", backend="codex")
+
+    events = [
+        make_event(
+            kind=TASK_CREATED,
+            actor=actor_user,
+            task_id="t3",
+            chain_id="c3",
+            data={
+                "prompt": "do thing",
+                "role_target": "executor",
+                "stage": "execution",
+                "priority": 100,
+                "quality_gate": {"acceptance_criteria": [], "required_checks": [], "review_mode": "hard"},
+                "budgets": {"max_handoffs": 8, "max_reworks": 2, "max_failures": 3},
+                "targets": {"backends": ["codex"], "agent_ids": []},
+                "attempt": 1,
+            },
+        ),
+        make_event(
+            kind=TASK_CLAIMED,
+            actor=actor_exec,
+            task_id="t3",
+            chain_id="c3",
+            run_id="run3",
+            data={"agent_id": "exec1", "backend": "codex", "lease_expires_at": format_ts(now + timedelta(seconds=30))},
+        ),
+        make_event(
+            kind=TASK_STARTED,
+            actor=actor_exec,
+            task_id="t3",
+            chain_id="c3",
+            run_id="run3",
+            data={"executor_agent_id": "exec1", "backend": "codex"},
+        ),
+        make_event(
+            kind=TASK_COMPLETED,
+            actor=actor_exec,
+            task_id="t3",
+            chain_id="c3",
+            run_id="run3",
+            data={"exit_code": 0, "duration_ms": 100, "stdout": "", "stderr": "", "final_output": "", "backend": "codex"},
+        ),
+        make_event(
+            kind=REVIEW_PASSED,
+            actor=Actor(type="agent", id="rev1", backend="claude"),
+            task_id="t3",
+            chain_id="c3",
+            run_id="run3",
+            data={"reason": "gate passed"},
+        ),
+    ]
+
+    state = reduce_events(events)
+    run = state.runs["run3"]
+    assert run.review_outcome == "passed"
+
+    candidates = list_supervisable_runs(state, now=now, reviewer_agent_id="rev2")
+    assert all(candidate.run_id != "run3" for candidate in candidates)

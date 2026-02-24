@@ -270,9 +270,18 @@ def reduce_events(events: list[dict[str, Any]]) -> ReducedState:
 
         elif kind == REVIEW_REWORK_REQUESTED and chain is not None:
             chain.rework_count += 1
+            if run_id and run_id in state.runs:
+                run = state.runs[run_id]
+                run.review_outcome = "rework_requested"
+                run.reviewed_at = event_ts
+                run.updated_at = event_ts
 
         elif kind == REVIEW_PASSED:
-            pass
+            if run_id and run_id in state.runs:
+                run = state.runs[run_id]
+                run.review_outcome = "passed"
+                run.reviewed_at = event_ts
+                run.updated_at = event_ts
 
         elif kind == ESCALATION_RAISED and chain is not None:
             chain.escalations += 1
@@ -340,12 +349,16 @@ def list_supervisable_runs(
 ) -> list[RunView]:
     runs: list[RunView] = []
     for run in state.runs.values():
-        if not run.is_active(now):
+        terminal_needs_review = run.status in {"completed", "failed", "stopped"} and run.review_outcome is None
+        if not run.is_active(now) and not terminal_needs_review:
             continue
         if run.reviewer_agent_id == reviewer_agent_id:
             runs.append(run)
             continue
         if run.reviewer_agent_id is None:
+            runs.append(run)
+            continue
+        if terminal_needs_review and run.reviewer_lease_expires_at is None:
             runs.append(run)
             continue
         if run.reviewer_lease_expires_at is not None and now >= run.reviewer_lease_expires_at:

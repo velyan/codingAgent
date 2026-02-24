@@ -233,6 +233,8 @@ class RunView:
     updated_at: datetime
     reviewer_agent_id: str | None = None
     reviewer_lease_expires_at: datetime | None = None
+    review_outcome: str | None = None
+    reviewed_at: datetime | None = None
     completed_at: datetime | None = None
 
     def is_active(self, now: datetime) -> bool:
