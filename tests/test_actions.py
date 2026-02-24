@@ -43,3 +43,18 @@ def test_parse_stream_json_envelope_extracts_actions() -> None:
     assert result.actions[0].type == "steer"
     assert result.actions[0].payload["run_id"] == "run-1"
     assert result.actions[0].payload["action"] == "pause"
+
+
+def test_parse_stream_json_fragmented_action_payload() -> None:
+    payload = "\n".join(
+        [
+            '{"type":"delta","text":"{\\"agentbus_actions\\":["}',
+            '{"type":"delta","text":"{\\"type\\":\\"steer\\",\\"run_id\\":\\"run-2\\",\\"action\\":\\"stop\\",\\"message\\":\\"danger\\"}"}',
+            '{"type":"delta","text":"]}"}',
+        ]
+    )
+    result = parse_agentbus_actions(payload)
+    assert len(result.actions) == 1
+    assert result.actions[0].type == "steer"
+    assert result.actions[0].payload["run_id"] == "run-2"
+    assert result.actions[0].payload["action"] == "stop"

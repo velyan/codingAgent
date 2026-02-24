@@ -29,6 +29,7 @@ class ActionValidationError(ValueError):
 def _extract_json_payloads(text: str) -> list[dict[str, Any]]:
     payloads: list[dict[str, Any]] = []
     seen: set[str] = set()
+    stream_fragments: list[str] = []
 
     def _push(obj: dict[str, Any]) -> None:
         try:
@@ -43,6 +44,15 @@ def _extract_json_payloads(text: str) -> list[dict[str, Any]]:
     def _walk(value: Any) -> None:
         if isinstance(value, dict):
             _push(value)
+            # Keep text-bearing envelope fields to reconstruct stream-json partial output.
+            is_stream_envelope = "agentbus_actions" not in value and any(
+                key in value for key in ("text", "delta", "content")
+            )
+            if is_stream_envelope:
+                for key in ("text", "delta", "content"):
+                    field = value.get(key)
+                    if isinstance(field, str):
+                        stream_fragments.append(field)
             for nested in value.values():
                 _walk(nested)
             return
@@ -59,7 +69,6 @@ def _extract_json_payloads(text: str) -> list[dict[str, Any]]:
                     continue
                 if isinstance(obj, dict):
                     _walk(obj)
-
             stripped = value.strip()
             if stripped.startswith("{") and stripped.endswith("}"):
                 try:
@@ -68,6 +77,48 @@ def _extract_json_payloads(text: str) -> list[dict[str, Any]]:
                     obj = None
                 if isinstance(obj, dict):
                     _walk(obj)
+            return
+
+    def _extract_balanced_json_objects(raw: str) -> list[dict[str, Any]]:
+        found: list[dict[str, Any]] = []
+        start_idx: int | None = None
+        depth = 0
+        in_string = False
+        escaped = False
+        for idx, ch in enumerate(raw):
+            if in_string:
+                if escaped:
+                    escaped = False
+                    continue
+                if ch == "\\":
+                    escaped = True
+                    continue
+                if ch == '"':
+                    in_string = False
+                continue
+
+            if ch == '"':
+                in_string = True
+                continue
+            if ch == "{":
+                if depth == 0:
+                    start_idx = idx
+                depth += 1
+                continue
+            if ch == "}":
+                if depth == 0:
+                    continue
+                depth -= 1
+                if depth == 0 and start_idx is not None:
+                    candidate = raw[start_idx : idx + 1]
+                    try:
+                        obj = json.loads(candidate)
+                    except json.JSONDecodeError:
+                        obj = None
+                    if isinstance(obj, dict):
+                        found.append(obj)
+                    start_idx = None
+        return found
 
     # Parse JSON code fences from the full text.
     for match in _JSON_FENCE_RE.finditer(text):
@@ -101,6 +152,11 @@ def _extract_json_payloads(text: str) -> list[dict[str, Any]]:
         except json.JSONDecodeError:
             continue
         if isinstance(obj, dict):
+            _walk(obj)
+
+    if stream_fragments:
+        reconstructed = "".join(stream_fragments)
+        for obj in _extract_balanced_json_objects(reconstructed):
             _walk(obj)
 
     return payloads

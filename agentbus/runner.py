@@ -1085,11 +1085,14 @@ def _reviewer_model_actions(
         task_prompt=task_prompt,
         window_text=window_text,
     )
+    # `codex exec resume` does not accept `--sandbox`, so reviewer reads for codex
+    # use fresh non-resume turns where read-only sandbox can be enforced safely.
+    resume = config.backend != "codex"
     command = adapter.build_command(
         prompt=prompt,
         config=config,
         agent_state=agent_state,
-        resume=True,
+        resume=resume,
     )
     safe_argv = _enforce_reviewer_readonly_command(config.backend, command.argv)
 

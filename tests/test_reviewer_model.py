@@ -6,8 +6,12 @@ from agentbus.models import AgentState, RunConfig
 
 
 class _FakeAdapter:
+    def __init__(self) -> None:
+        self.last_resume = None
+
     def build_command(self, *, prompt, config, agent_state, resume):
-        del prompt, config, agent_state, resume
+        del prompt, config, agent_state
+        self.last_resume = resume
 
         class _Cmd:
             argv = ["fake-cmd", "arg"]
@@ -27,7 +31,8 @@ class _Completed:
 
 
 def test_reviewer_model_actions_parses_steer(monkeypatch, tmp_path: Path) -> None:
-    monkeypatch.setattr(runner, "get_adapter", lambda _backend: _FakeAdapter())
+    fake = _FakeAdapter()
+    monkeypatch.setattr(runner, "get_adapter", lambda _backend: fake)
     called_argv = []
 
     def _fake_run(argv, cwd, env, capture_output, text, timeout):
@@ -63,6 +68,7 @@ def test_reviewer_model_actions_parses_steer(monkeypatch, tmp_path: Path) -> Non
     assert state.backend_state.get("reviewed") is True
     assert "--permission-mode" in called_argv
     assert "plan" in called_argv
+    assert fake.last_resume is True
 
 
 def test_reviewer_model_actions_rejects_wrong_run(monkeypatch, tmp_path: Path) -> None:
@@ -109,3 +115,34 @@ def test_enforce_reviewer_readonly_command_flags() -> None:
     cursor = runner._enforce_reviewer_readonly_command("cursor", ["cursor-agent", "-p", "prompt"])
     assert "--mode" in cursor
     assert "plan" in cursor
+
+
+def test_reviewer_model_uses_non_resume_for_codex(monkeypatch, tmp_path: Path) -> None:
+    fake = _FakeAdapter()
+    monkeypatch.setattr(runner, "get_adapter", lambda _backend: fake)
+
+    def _fake_run(argv, cwd, env, capture_output, text, timeout):
+        del argv, cwd, env, capture_output, text, timeout
+        return _Completed('{"agentbus_actions":[]}')
+
+    monkeypatch.setattr(subprocess, "run", _fake_run)
+
+    cfg = RunConfig(
+        log_file=str(tmp_path / "bus.jsonl"),
+        agent_id="rev1",
+        backend="codex",
+        role="reviewer",
+        cwd=str(tmp_path),
+    )
+    actions, rejected = runner._reviewer_model_actions(
+        config=cfg,
+        agent_state=AgentState(),
+        run_id="run-1",
+        chain_objective="obj",
+        done_when="done",
+        task_prompt="task",
+        window_text="out",
+    )
+    assert actions == []
+    assert rejected == []
+    assert fake.last_resume is False
