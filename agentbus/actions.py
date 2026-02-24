@@ -8,6 +8,7 @@ from typing import Any
 from agentbus.models import SUPPORTED_CONTROL_ACTIONS
 
 _JSON_FENCE_RE = re.compile(r"```json\s*(\{.*?\})\s*```", re.DOTALL)
+_MISSING = object()
 
 
 @dataclass
@@ -24,6 +25,35 @@ class ParseResult:
 
 class ActionValidationError(ValueError):
     pass
+
+
+def _coerce_int(value: Any, *, field: str, default: int) -> int:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        raise ActionValidationError(f"{field} must be an integer")
+    try:
+        return int(value)
+    except (TypeError, ValueError) as exc:
+        raise ActionValidationError(f"{field} must be an integer") from exc
+
+
+def _coerce_string_list(
+    value: Any,
+    *,
+    field: str,
+    default: list[str] | None = None,
+    allow_single_string: bool = False,
+) -> list[str]:
+    if value is _MISSING:
+        return list(default or [])
+    if value is None:
+        raise ActionValidationError(f"{field} must be a list")
+    if allow_single_string and isinstance(value, str):
+        return [value]
+    if not isinstance(value, list):
+        raise ActionValidationError(f"{field} must be a list")
+    return [str(item) for item in value]
 
 
 def _extract_json_payloads(text: str) -> list[dict[str, Any]]:
@@ -190,18 +220,28 @@ def _validate_action(raw: dict[str, Any]) -> ParsedAction:
             raise ActionValidationError("create_task requires valid target_role")
         if not prompt:
             raise ActionValidationError("create_task requires prompt")
-        backends = raw.get("target_backend") or []
-        if isinstance(backends, str):
-            backends = [backends]
         return ParsedAction(
             type="create_task",
             payload={
                 "target_role": target_role,
-                "target_backend": [str(x) for x in backends],
+                "target_backend": _coerce_string_list(
+                    raw.get("target_backend", _MISSING),
+                    field="target_backend",
+                    default=[],
+                    allow_single_string=True,
+                ),
                 "prompt": prompt,
-                "priority": int(raw.get("priority", 100)),
-                "acceptance_criteria": [str(x) for x in raw.get("acceptance_criteria", [])],
-                "required_checks": [str(x) for x in raw.get("required_checks", [])],
+                "priority": _coerce_int(raw.get("priority", 100), field="priority", default=100),
+                "acceptance_criteria": _coerce_string_list(
+                    raw.get("acceptance_criteria", _MISSING),
+                    field="acceptance_criteria",
+                    default=[],
+                ),
+                "required_checks": _coerce_string_list(
+                    raw.get("required_checks", _MISSING),
+                    field="required_checks",
+                    default=[],
+                ),
                 "review_mode": str(raw.get("review_mode", "hard")),
                 "stage": str(raw.get("stage", "execution")),
             },
@@ -247,7 +287,9 @@ def parse_agentbus_actions(text: str) -> ParseResult:
                 continue
             try:
                 actions.append(_validate_action(item))
-            except ActionValidationError as exc:
+            except (ActionValidationError, TypeError, ValueError) as exc:
                 rejected.append(str(exc))
+            except Exception as exc:  # pragma: no cover - defensive safety net
+                rejected.append(f"unexpected action validation error: {exc}")
 
     return ParseResult(actions=actions, rejected_reasons=rejected)

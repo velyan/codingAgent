@@ -58,3 +58,20 @@ def test_parse_stream_json_fragmented_action_payload() -> None:
     assert result.actions[0].type == "steer"
     assert result.actions[0].payload["run_id"] == "run-2"
     assert result.actions[0].payload["action"] == "stop"
+
+
+def test_parse_rejects_malformed_create_task_payload_without_crashing() -> None:
+    payload = """
+```json
+{
+  "agentbus_actions": [
+    {"type": "create_task", "target_role": "executor", "prompt": "do x", "priority": "high"},
+    {"type": "create_task", "target_role": "executor", "prompt": "do y", "acceptance_criteria": null}
+  ]
+}
+```
+"""
+    result = parse_agentbus_actions(payload)
+    assert len(result.actions) == 0
+    assert any("priority must be an integer" in reason for reason in result.rejected_reasons)
+    assert any("acceptance_criteria must be a list" in reason for reason in result.rejected_reasons)

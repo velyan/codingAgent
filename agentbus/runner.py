@@ -385,6 +385,7 @@ def _apply_actions(
         fingerprints = pending_task_fingerprints(existing_state, task.chain_id)
         chain_view = existing_state.chains.get(task.chain_id)
         handoff_breach_emitted = False
+        escalation_emitted = False
         for action in result.actions:
             if action.type == "create_task":
                 if chain_view is not None and chain_view.handoff_count >= task.budgets.max_handoffs:
@@ -416,6 +417,9 @@ def _apply_actions(
                             ),
                         )
                         handoff_breach_emitted = True
+                        escalation_emitted = True
+                    if escalation_emitted:
+                        break
                     continue
 
                 payload = action.payload
@@ -508,6 +512,8 @@ def _apply_actions(
                     run_id=run_id,
                     reason=str(action.payload.get("reason", "")),
                 )
+                escalation_emitted = True
+                break
 
             elif action.type == "steer":
                 payload = action.payload
@@ -1186,6 +1192,7 @@ def _execute_worker_task(
                     return
 
                 if control.action == "nudge":
+                    proposed_nudge_count = nudge_count + 1
                     store.append(
                         make_event(
                             kind=REVIEWER_CONTROL_APPLIED,
@@ -1201,6 +1208,44 @@ def _execute_worker_task(
                             },
                         )
                     )
+                    nudge_count = proposed_nudge_count
+                    if nudge_count > config.max_nudges_per_run:
+                        fail_event = make_event(
+                            kind=TASK_FAILED,
+                            actor=actor,
+                            task_id=task.task_id,
+                            chain_id=task.chain_id,
+                            run_id=run_id,
+                            data={
+                                "exit_code": run_result.exit_code,
+                                "duration_ms": run_result.duration_ms,
+                                "stdout": stdout_clipped,
+                                "stderr": stderr_clipped,
+                                "final_output": final_clipped,
+                                "error": "max nudges exceeded",
+                                "error_signature": _error_signature(run_result.stdout, run_result.stderr),
+                                "backend": config.backend,
+                            },
+                        )
+                        _append_events(store, [fail_event])
+                        _emit_escalation(
+                            append_events=store.append_many,
+                            config=config,
+                            actor=actor,
+                            chain_id=task.chain_id,
+                            task_id=task.task_id,
+                            run_id=run_id,
+                            reason="max_nudges exceeded",
+                            guardrail_payload=_build_guardrail_payload(
+                                scope="run",
+                                rule="max_nudges",
+                                observed=nudge_count,
+                                threshold=config.max_nudges_per_run,
+                                detail="nudge limit exceeded while paused",
+                            ),
+                        )
+                        store.save_agent_state(config.agent_id, agent_state)
+                        return
                     paused_note = control.message or paused_note
                     store.append(
                         make_event(

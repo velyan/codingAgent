@@ -6,6 +6,7 @@ from pathlib import Path
 import agentbus.runner as runner
 from agentbus.events import make_event
 from agentbus.models import (
+    CHAIN_COMPLETED,
     CONTROL_SEVERITY,
     ESCALATION_RAISED,
     GUARDRAIL_BREACHED,
@@ -285,6 +286,86 @@ def test_execute_worker_task_escalates_on_max_nudges(monkeypatch, tmp_path: Path
     assert any(event["kind"] == ESCALATION_RAISED for event in events)
 
 
+def test_execute_worker_task_escalates_on_paused_nudge_limit(monkeypatch, tmp_path: Path) -> None:
+    cfg = _default_run_config(tmp_path)
+    cfg.max_nudges_per_run = 0
+    cfg.pause_timeout_seconds = 60
+    cfg.run_timeout_seconds = 300
+    store = JsonlEventStore(cfg.log_file)
+    task = _sample_task()
+    _seed_task_created(store, task)
+    run_id = "run-paused-nudge-limit"
+
+    monkeypatch.setattr(runner, "get_adapter", lambda _backend: _FakeAdapter())
+    monkeypatch.setattr(runner.time, "monotonic", _TickClock(step=1.0))
+    monkeypatch.setattr(runner.time, "sleep", lambda _seconds: None)
+
+    def _fake_stream(**kwargs):
+        on_tick = kwargs["on_tick"]
+        proc = _FakeProc()
+        store.append(
+            make_event(
+                kind=REVIEWER_SUPERVISION_CLAIMED,
+                actor=Actor(type="agent", id="rev-1", backend="claude"),
+                task_id=task.task_id,
+                chain_id=task.chain_id,
+                run_id=run_id,
+                data={
+                    "reviewer_agent_id": "rev-1",
+                    "lease_expires_at": format_ts(utc_now() + timedelta(seconds=60)),
+                },
+            )
+        )
+        store.append(
+            make_event(
+                kind=REVIEWER_CONTROL_REQUESTED,
+                actor=Actor(type="agent", id="rev-1", backend="claude"),
+                task_id=task.task_id,
+                chain_id=task.chain_id,
+                run_id=run_id,
+                data={
+                    "action": "pause",
+                    "message": "hold",
+                    "severity": CONTROL_SEVERITY["pause"],
+                    "source": "agent",
+                    "ts_request": format_ts(utc_now()),
+                },
+            )
+        )
+        store.append(
+            make_event(
+                kind=REVIEWER_CONTROL_REQUESTED,
+                actor=Actor(type="agent", id="rev-1", backend="claude"),
+                task_id=task.task_id,
+                chain_id=task.chain_id,
+                run_id=run_id,
+                data={
+                    "action": "nudge",
+                    "message": "adjust while paused",
+                    "severity": CONTROL_SEVERITY["nudge"],
+                    "source": "agent",
+                    "ts_request": format_ts(utc_now()),
+                },
+            )
+        )
+        on_tick(proc)
+        return StreamRunResult(stdout="", stderr="", exit_code=130, duration_ms=50)
+
+    monkeypatch.setattr(runner, "run_streaming_subprocess", _fake_stream)
+
+    runner._execute_worker_task(
+        store=store,
+        config=cfg,
+        agent_state=AgentState(),
+        task=task,
+        run_id=run_id,
+    )
+
+    events = store.read_all()
+    assert any(event["kind"] == GUARDRAIL_BREACHED and event["data"].get("rule") == "max_nudges" for event in events)
+    assert any(event["kind"] == ESCALATION_RAISED for event in events)
+
+
 def test_execute_worker_task_escalates_on_max_restarts(monkeypatch, tmp_path: Path) -> None:
     cfg = _default_run_config(tmp_path)
     cfg.max_nudges_per_run = 10
@@ -411,7 +492,12 @@ def test_apply_actions_rejects_create_task_when_max_handoffs_exceeded(tmp_path: 
         config=cfg,
         task=task,
         run_id="run-handoff",
-        final_output='{"agentbus_actions":[{"type":"create_task","target_role":"executor","prompt":"new task"}]}',
+        final_output=(
+            '{"agentbus_actions":['
+            '{"type":"create_task","target_role":"executor","prompt":"new task"},'
+            '{"type":"mark_objective_complete","chain_id":"chain-1"}'
+            "]}"
+        ),
     )
 
     events = store.read_all()
@@ -421,6 +507,11 @@ def test_apply_actions_rejects_create_task_when_max_handoffs_exceeded(tmp_path: 
     )
     assert any(event["kind"] == GUARDRAIL_BREACHED and event["data"].get("rule") == "max_handoffs" for event in events)
     assert any(event["kind"] == ESCALATION_RAISED for event in events)
+    assert not any(event["kind"] == CHAIN_COMPLETED for event in events)
+
+    chain = reduce_events(events).chains[chain_id]
+    assert chain.paused is True
+    assert chain.completed is False
 
 
 def test_claim_next_task_escalates_on_max_failures_and_pauses_chain(tmp_path: Path) -> None:
