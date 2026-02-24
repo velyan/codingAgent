@@ -10,6 +10,32 @@ readme = "README.md"
 requires-python = ">=3.9"
 authors = [{ name = "AgentBus" }]
 dependencies = []
+keywords = [
+  "agent-orchestration",
+  "multi-agent",
+  "codex",
+  "claude",
+  "cursor",
+  "event-sourcing",
+  "jsonl",
+  "autonomous-agents"
+]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: POSIX",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.9",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+]
+
+[project.urls]
+Homepage = "https://github.com/velyan/codingAgent"
+Repository = "https://github.com/velyan/codingAgent"
+Issues = "https://github.com/velyan/codingAgent/issues"
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0"]
