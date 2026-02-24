@@ -10,11 +10,11 @@ from uuid import uuid4
 
 from agentbus.actions import parse_agentbus_actions
 from agentbus.adapters import get_adapter
-from agentbus.control import choose_control
 from agentbus.events import make_event
 from agentbus.models import (
     ACTION_REJECTED,
     CHAIN_COMPLETED,
+    CONTROL_SEVERITY,
     ESCALATION_RAISED,
     OBJECTIVE_CREATED,
     REVIEWER_CONTROL_APPLIED,
@@ -186,14 +186,21 @@ def _emit_control_rejected(
     task_id: str,
     run_id: str,
     reason: str,
+    rejected_event_id: str | None = None,
+    rejected_action: str | None = None,
 ) -> None:
+    payload: dict[str, Any] = {"reason": reason}
+    if rejected_event_id:
+        payload["rejected_event_id"] = rejected_event_id
+    if rejected_action:
+        payload["action"] = rejected_action
     event = make_event(
         kind=REVIEWER_CONTROL_REJECTED,
         actor=Actor(type="agent", id=config.agent_id, backend=config.backend),
         chain_id=chain_id,
         task_id=task_id,
         run_id=run_id,
-        data={"reason": reason},
+        data=payload,
     )
     store.append(event)
 
@@ -334,7 +341,7 @@ def _apply_actions(
                         data={
                             "action": action_name,
                             "message": payload.get("message", ""),
-                            "severity": {"resume": 0, "nudge": 1, "rework": 2, "pause": 3, "stop": 4}[action_name],
+                            "severity": CONTROL_SEVERITY[action_name],
                             "source": "agent",
                             "ts_request": format_ts(utc_now()),
                         },
@@ -466,8 +473,23 @@ def _execute_worker_task(
                         task_id=task.task_id,
                         run_id=run_id,
                         reason="control from non-owner reviewer",
+                        rejected_event_id=control.event_id,
+                        rejected_action=control.action,
                     )
                     return
+
+            if control.action == "resume":
+                _emit_control_rejected(
+                    store=store,
+                    config=config,
+                    chain_id=task.chain_id,
+                    task_id=task.task_id,
+                    run_id=run_id,
+                    reason="resume is only valid while paused",
+                    rejected_event_id=control.event_id,
+                    rejected_action=control.action,
+                )
+                return
 
             chosen_control_id = control.event_id
             chosen_control_action = control.action
@@ -656,8 +678,25 @@ def _execute_worker_task(
             return
 
         if pending_pause:
+            pause_last_heartbeat = time.monotonic()
             while True:
                 time.sleep(max(0.2, config.poll_seconds))
+                now_monotonic = time.monotonic()
+                if now_monotonic - pause_last_heartbeat >= config.heartbeat_seconds:
+                    store.append(
+                        make_event(
+                            kind=TASK_HEARTBEAT,
+                            actor=actor,
+                            task_id=task.task_id,
+                            chain_id=task.chain_id,
+                            run_id=run_id,
+                            data={
+                                "lease_expires_at": format_ts(utc_now() + timedelta(seconds=config.lease_seconds)),
+                            },
+                        )
+                    )
+                    pause_last_heartbeat = now_monotonic
+
                 state = reduce_events(store.read_all())
                 control = get_top_control(state, run_id)
                 if control is None:
@@ -672,24 +711,27 @@ def _execute_worker_task(
                             task_id=task.task_id,
                             run_id=run_id,
                             reason="control from non-owner reviewer",
+                            rejected_event_id=control.event_id,
+                            rejected_action=control.action,
                         )
                         continue
-                applied = make_event(
-                    kind=REVIEWER_CONTROL_APPLIED,
-                    actor=actor,
-                    task_id=task.task_id,
-                    chain_id=task.chain_id,
-                    run_id=run_id,
-                    data={
-                        "chosen_event_id": control.event_id,
-                        "action": control.action,
-                        "executor_agent_id": config.agent_id,
-                        "outcome": "accepted",
-                    },
-                )
-                store.append(applied)
 
                 if control.action == "resume":
+                    store.append(
+                        make_event(
+                            kind=REVIEWER_CONTROL_APPLIED,
+                            actor=actor,
+                            task_id=task.task_id,
+                            chain_id=task.chain_id,
+                            run_id=run_id,
+                            data={
+                                "chosen_event_id": control.event_id,
+                                "action": control.action,
+                                "executor_agent_id": config.agent_id,
+                                "outcome": "accepted",
+                            },
+                        )
+                    )
                     store.append(
                         make_event(
                             kind=RUN_RESUMED,
@@ -703,7 +745,23 @@ def _execute_worker_task(
                     prompt = f"{task.prompt}\n\n[Resume Guidance]\n{control.message or paused_note}"
                     pending_pause = False
                     break
+
                 if control.action == "stop":
+                    store.append(
+                        make_event(
+                            kind=REVIEWER_CONTROL_APPLIED,
+                            actor=actor,
+                            task_id=task.task_id,
+                            chain_id=task.chain_id,
+                            run_id=run_id,
+                            data={
+                                "chosen_event_id": control.event_id,
+                                "action": control.action,
+                                "executor_agent_id": config.agent_id,
+                                "outcome": "accepted",
+                            },
+                        )
+                    )
                     fail_event = make_event(
                         kind=TASK_FAILED,
                         actor=actor,
@@ -732,6 +790,137 @@ def _execute_worker_task(
                     _append_events(store, [fail_event, escalation])
                     store.save_agent_state(config.agent_id, agent_state)
                     return
+
+                if control.action == "nudge":
+                    store.append(
+                        make_event(
+                            kind=REVIEWER_CONTROL_APPLIED,
+                            actor=actor,
+                            task_id=task.task_id,
+                            chain_id=task.chain_id,
+                            run_id=run_id,
+                            data={
+                                "chosen_event_id": control.event_id,
+                                "action": control.action,
+                                "executor_agent_id": config.agent_id,
+                                "outcome": "accepted",
+                            },
+                        )
+                    )
+                    paused_note = control.message or paused_note
+                    store.append(
+                        make_event(
+                            kind=RUN_INTERRUPTED,
+                            actor=actor,
+                            task_id=task.task_id,
+                            chain_id=task.chain_id,
+                            run_id=run_id,
+                            data={"reason": paused_note or "nudged while paused"},
+                        )
+                    )
+                    continue
+
+                if control.action == "rework":
+                    store.append(
+                        make_event(
+                            kind=REVIEWER_CONTROL_APPLIED,
+                            actor=actor,
+                            task_id=task.task_id,
+                            chain_id=task.chain_id,
+                            run_id=run_id,
+                            data={
+                                "chosen_event_id": control.event_id,
+                                "action": control.action,
+                                "executor_agent_id": config.agent_id,
+                                "outcome": "accepted",
+                            },
+                        )
+                    )
+                    requested = make_event(
+                        kind=REVIEW_REWORK_REQUESTED,
+                        actor=actor,
+                        task_id=task.task_id,
+                        chain_id=task.chain_id,
+                        run_id=run_id,
+                        data={"reason": control.message or "rework requested while paused"},
+                    )
+                    if task.attempt >= task.budgets.max_reworks + 1:
+                        escalation = make_event(
+                            kind=ESCALATION_RAISED,
+                            actor=actor,
+                            task_id=task.task_id,
+                            chain_id=task.chain_id,
+                            run_id=run_id,
+                            data={"reason": "rework budget exceeded"},
+                        )
+                        fail_event = make_event(
+                            kind=TASK_FAILED,
+                            actor=actor,
+                            task_id=task.task_id,
+                            chain_id=task.chain_id,
+                            run_id=run_id,
+                            data={
+                                "exit_code": run_result.exit_code,
+                                "duration_ms": run_result.duration_ms,
+                                "stdout": stdout_clipped,
+                                "stderr": stderr_clipped,
+                                "final_output": final_clipped,
+                                "error": "rework budget exceeded while paused",
+                                "error_signature": _error_signature(run_result.stdout, run_result.stderr),
+                                "backend": config.backend,
+                            },
+                        )
+                        _append_events(store, [requested, fail_event, escalation])
+                        store.save_agent_state(config.agent_id, agent_state)
+                        return
+
+                    new_task_id = str(uuid4())
+                    rework_task = _task_created_event(
+                        actor=actor,
+                        task_id=new_task_id,
+                        chain_id=task.chain_id,
+                        prompt=f"{task.prompt}\n\n[Rework]\n{control.message}",
+                        role_target="executor",
+                        stage="rework",
+                        priority=task.priority,
+                        targets=task.targets,
+                        quality_gate=task.quality_gate,
+                        budgets=task.budgets,
+                        parent_task_id=task.task_id,
+                        attempt=task.attempt + 1,
+                    )
+                    fail_event = make_event(
+                        kind=TASK_FAILED,
+                        actor=actor,
+                        task_id=task.task_id,
+                        chain_id=task.chain_id,
+                        run_id=run_id,
+                        data={
+                            "exit_code": run_result.exit_code,
+                            "duration_ms": run_result.duration_ms,
+                            "stdout": stdout_clipped,
+                            "stderr": stderr_clipped,
+                            "final_output": final_clipped,
+                            "error": "rework requested while paused",
+                            "error_signature": _error_signature(run_result.stdout, run_result.stderr),
+                            "backend": config.backend,
+                        },
+                    )
+                    _append_events(store, [requested, fail_event, rework_task])
+                    store.save_agent_state(config.agent_id, agent_state)
+                    return
+
+                _emit_control_rejected(
+                    store=store,
+                    config=config,
+                    chain_id=task.chain_id,
+                    task_id=task.task_id,
+                    run_id=run_id,
+                    reason="unsupported control while paused",
+                    rejected_event_id=control.event_id,
+                    rejected_action=control.action,
+                )
+
             if pending_pause:
                 continue
             store.append(
@@ -811,6 +1000,100 @@ def _reviewer_heuristic_actions(window_text: str) -> list[tuple[str, str]]:
             actions.append((action, reason))
             break
     return actions
+
+
+def _build_reviewer_prompt(
+    *,
+    run_id: str,
+    chain_objective: str,
+    done_when: str,
+    task_prompt: str,
+    window_text: str,
+) -> str:
+    return (
+        "You are a live reviewer supervising an executor run. "
+        "Return only a JSON object with `agentbus_actions`.\n\n"
+        "Allowed action output format:\n"
+        '{\"agentbus_actions\":[{\"type\":\"steer\",\"run_id\":\"'
+        + run_id
+        + '\",\"action\":\"nudge|pause|stop|rework|resume\",\"message\":\"short reason\"}]}\n\n'
+        "If no intervention is needed, return:\n"
+        '{"agentbus_actions":[]}\n\n'
+        "Rules:\n"
+        "- Use `stop` for clearly dangerous/destructive behavior.\n"
+        "- Use `pause` for uncertain high-risk behavior.\n"
+        "- Use `nudge` for corrective guidance.\n"
+        "- Use `rework` if current approach should be abandoned.\n"
+        "- Use `resume` only if run is paused and should continue.\n\n"
+        f"Objective: {chain_objective}\n"
+        f"Done when: {done_when}\n"
+        f"Task prompt: {task_prompt}\n"
+        "Recent stream window:\n"
+        f"{window_text}\n"
+    )
+
+
+def _reviewer_model_actions(
+    *,
+    config: RunConfig,
+    agent_state: AgentState,
+    run_id: str,
+    chain_objective: str,
+    done_when: str,
+    task_prompt: str,
+    window_text: str,
+) -> tuple[list[tuple[str, str]], list[str]]:
+    adapter = get_adapter(config.backend)
+    prompt = _build_reviewer_prompt(
+        run_id=run_id,
+        chain_objective=chain_objective,
+        done_when=done_when,
+        task_prompt=task_prompt,
+        window_text=window_text,
+    )
+    command = adapter.build_command(
+        prompt=prompt,
+        config=config,
+        agent_state=agent_state,
+        resume=True,
+    )
+
+    try:
+        completed = subprocess.run(
+            command.argv,
+            cwd=config.cwd,
+            env=command.env,
+            capture_output=True,
+            text=True,
+            timeout=max(20, int(config.review_cadence_seconds * 4)),
+        )
+    except Exception as exc:  # noqa: BLE001 - robustness in reviewer loop
+        return [], [f"reviewer backend invocation failed: {exc}"]
+
+    stdout = completed.stdout or ""
+    stderr = completed.stderr or ""
+    adapter.after_run(stdout=stdout, stderr=stderr, agent_state=agent_state)
+
+    combined = stdout if not stderr else f"{stdout}\n{stderr}"
+    parsed = parse_agentbus_actions(combined)
+    actions: list[tuple[str, str]] = []
+    rejections: list[str] = list(parsed.rejected_reasons)
+
+    for parsed_action in parsed.actions:
+        if parsed_action.type != "steer":
+            rejections.append(f"reviewer action `{parsed_action.type}` is unsupported in live supervision")
+            continue
+        payload_run_id = str(parsed_action.payload.get("run_id") or "")
+        if payload_run_id != run_id:
+            rejections.append(f"steer run_id mismatch: expected {run_id}, got {payload_run_id or '<empty>'}")
+            continue
+        action_name = str(parsed_action.payload.get("action") or "")
+        if action_name not in CONTROL_SEVERITY:
+            rejections.append(f"unsupported steer action from reviewer backend: {action_name}")
+            continue
+        actions.append((action_name, str(parsed_action.payload.get("message") or "").strip()))
+
+    return actions, rejections
 
 
 def _claim_supervision(
@@ -925,8 +1208,40 @@ def _reviewer_loop(*, store: JsonlEventStore, config: RunConfig, agent_state: Ag
 
             if now_monotonic - last_review >= config.review_cadence_seconds and stream_buffer:
                 window = "\n".join(stream_buffer[-200:])
-                actions = _reviewer_heuristic_actions(window)
+                chain = state.chains.get(run.chain_id)
+                task_view = state.tasks.get(run.task_id)
+                model_actions, model_rejections = _reviewer_model_actions(
+                    config=config,
+                    agent_state=agent_state,
+                    run_id=run.run_id,
+                    chain_objective=chain.objective if chain is not None else "",
+                    done_when=chain.done_when if chain is not None else "",
+                    task_prompt=task_view.prompt if task_view is not None else "",
+                    window_text=window,
+                )
+                store.save_agent_state(config.agent_id, agent_state)
+
+                heuristic_actions = _reviewer_heuristic_actions(window)
+                action_keys = {(action_name, reason) for action_name, reason in heuristic_actions}
+                actions = list(heuristic_actions)
+                for action_name, reason in model_actions:
+                    key = (action_name, reason)
+                    if key not in action_keys:
+                        actions.append((action_name, reason))
+                        action_keys.add(key)
+
                 events: list[dict[str, Any]] = []
+                for reason in model_rejections:
+                    events.append(
+                        make_event(
+                            kind=ACTION_REJECTED,
+                            actor=actor,
+                            task_id=run.task_id,
+                            chain_id=run.chain_id,
+                            run_id=run.run_id,
+                            data={"reason": reason},
+                        )
+                    )
                 for action_name, reason in actions:
                     events.append(
                         make_event(
@@ -938,7 +1253,7 @@ def _reviewer_loop(*, store: JsonlEventStore, config: RunConfig, agent_state: Ag
                             data={
                                 "action": action_name,
                                 "message": reason,
-                                "severity": {"resume": 0, "nudge": 1, "rework": 2, "pause": 3, "stop": 4}[action_name],
+                                "severity": CONTROL_SEVERITY[action_name],
                                 "source": "agent",
                                 "ts_request": format_ts(utc_now()),
                             },
@@ -1092,7 +1407,7 @@ def post_control(
         data={
             "action": action,
             "message": message,
-            "severity": {"resume": 0, "nudge": 1, "rework": 2, "pause": 3, "stop": 4}[action],
+            "severity": CONTROL_SEVERITY[action],
             "source": "human",
             "ts_request": format_ts(utc_now()),
         },

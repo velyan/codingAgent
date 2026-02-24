@@ -11,6 +11,7 @@ from agentbus.models import (
     ESCALATION_RAISED,
     OBJECTIVE_CREATED,
     REVIEWER_CONTROL_APPLIED,
+    REVIEWER_CONTROL_REJECTED,
     REVIEWER_CONTROL_REQUESTED,
     REVIEWER_SUPERVISION_CLAIMED,
     REVIEWER_SUPERVISION_HEARTBEAT,
@@ -255,6 +256,15 @@ def reduce_events(events: list[dict[str, Any]]) -> ReducedState:
                     request for request in state.pending_controls[run_id] if request.event_id != chosen_id
                 ]
 
+        elif kind == REVIEWER_CONTROL_REJECTED:
+            rejected_id = str(data.get("rejected_event_id") or "")
+            if rejected_id:
+                state.applied_control_event_ids.add(rejected_id)
+            if run_id in state.pending_controls and rejected_id:
+                state.pending_controls[run_id] = [
+                    request for request in state.pending_controls[run_id] if request.event_id != rejected_id
+                ]
+
         elif kind == REVIEW_REWORK_REQUESTED and chain is not None:
             chain.rework_count += 1
 
@@ -269,7 +279,7 @@ def reduce_events(events: list[dict[str, Any]]) -> ReducedState:
             chain.completed = True
             chain.paused = False
 
-        elif kind in {ACTION_REJECTED, REVIEWER_CONTROL_REJECTED, STREAM_CHUNK}:
+        elif kind in {ACTION_REJECTED, STREAM_CHUNK}:
             pass
 
     return state

@@ -3,6 +3,7 @@ from datetime import timedelta
 from agentbus.events import make_event
 from agentbus.models import (
     REVIEWER_CONTROL_APPLIED,
+    REVIEWER_CONTROL_REJECTED,
     REVIEWER_CONTROL_REQUESTED,
     REVIEWER_SUPERVISION_CLAIMED,
     RUN_PAUSED,
@@ -113,3 +114,59 @@ def test_supervision_exclusivity_and_control_state() -> None:
     top = get_top_control(state, "run1")
     assert top is not None
     assert top.action == "pause"
+
+
+def test_rejected_control_is_consumed() -> None:
+    now = utc_now()
+    actor = Actor(type="agent", id="rev1", backend="claude")
+    events = [
+        {
+            "v": 1,
+            "event_id": "bad-control",
+            "ts": format_ts(now),
+            "kind": REVIEWER_CONTROL_REQUESTED,
+            "actor": actor.to_dict(),
+            "task_id": "t1",
+            "chain_id": "c1",
+            "run_id": "run1",
+            "data": {
+                "action": "stop",
+                "message": "bad reviewer",
+                "severity": 4,
+                "source": "agent",
+                "ts_request": format_ts(now),
+            },
+        },
+        {
+            "v": 1,
+            "event_id": "reject-bad",
+            "ts": format_ts(now + timedelta(seconds=1)),
+            "kind": REVIEWER_CONTROL_REJECTED,
+            "actor": {"type": "agent", "id": "exec1", "backend": "codex"},
+            "task_id": "t1",
+            "chain_id": "c1",
+            "run_id": "run1",
+            "data": {"reason": "non-owner", "rejected_event_id": "bad-control"},
+        },
+        {
+            "v": 1,
+            "event_id": "good-control",
+            "ts": format_ts(now + timedelta(seconds=2)),
+            "kind": REVIEWER_CONTROL_REQUESTED,
+            "actor": actor.to_dict(),
+            "task_id": "t1",
+            "chain_id": "c1",
+            "run_id": "run1",
+            "data": {
+                "action": "pause",
+                "message": "valid",
+                "severity": 3,
+                "source": "agent",
+                "ts_request": format_ts(now + timedelta(seconds=2)),
+            },
+        },
+    ]
+    state = reduce_events(events)
+    top = get_top_control(state, "run1")
+    assert top is not None
+    assert top.event_id == "good-control"
