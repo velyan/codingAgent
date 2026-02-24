@@ -94,3 +94,25 @@ def test_authorize_control_requires_claimed_reviewer_for_agent_controls() -> Non
     agent_control.actor_id = "rev-owner"
     authorized_owner, _ = runner._authorize_control(run_view=run_view, control=agent_control)
     assert authorized_owner
+
+
+def test_reviewer_owns_run_requires_exact_owner_match() -> None:
+    now = utc_now()
+    run_view = RunView(
+        run_id="run-1",
+        task_id="task-1",
+        chain_id="chain-1",
+        executor_agent_id="exec-1",
+        backend="codex",
+        status="running",
+        started_at=now,
+        updated_at=now,
+        reviewer_agent_id="rev-owner",
+    )
+
+    assert runner._reviewer_owns_run(run=run_view, reviewer_agent_id="rev-owner")
+    assert not runner._reviewer_owns_run(run=run_view, reviewer_agent_id="rev-other")
+
+    run_view.reviewer_agent_id = None
+    assert not runner._reviewer_owns_run(run=run_view, reviewer_agent_id="rev-owner")
+    assert not runner._reviewer_owns_run(run=None, reviewer_agent_id="rev-owner")

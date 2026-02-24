@@ -6,6 +6,7 @@ from agentbus.models import (
     REVIEWER_CONTROL_REJECTED,
     REVIEWER_CONTROL_REQUESTED,
     REVIEWER_SUPERVISION_CLAIMED,
+    REVIEWER_SUPERVISION_HEARTBEAT,
     RUN_PAUSED,
     TASK_CLAIMED,
     TASK_CREATED,
@@ -170,3 +171,67 @@ def test_rejected_control_is_consumed() -> None:
     top = get_top_control(state, "run1")
     assert top is not None
     assert top.event_id == "good-control"
+
+
+def test_non_owner_supervision_heartbeat_is_ignored() -> None:
+    now = utc_now()
+    initial_lease = now + timedelta(seconds=60)
+    forged_lease = now + timedelta(seconds=300)
+    actor_user = Actor(type="user", id="u1")
+    actor_exec = Actor(type="agent", id="exec1", backend="codex")
+
+    events = [
+        make_event(
+            kind=TASK_CREATED,
+            actor=actor_user,
+            task_id="t1",
+            chain_id="c1",
+            data={
+                "prompt": "do thing",
+                "role_target": "executor",
+                "stage": "execution",
+                "priority": 100,
+                "quality_gate": {"acceptance_criteria": [], "required_checks": [], "review_mode": "hard"},
+                "budgets": {"max_handoffs": 8, "max_reworks": 2, "max_failures": 3},
+                "targets": {"backends": ["codex"], "agent_ids": []},
+                "attempt": 1,
+            },
+        ),
+        make_event(
+            kind=TASK_CLAIMED,
+            actor=actor_exec,
+            task_id="t1",
+            chain_id="c1",
+            run_id="run1",
+            data={"agent_id": "exec1", "backend": "codex", "lease_expires_at": format_ts(now + timedelta(seconds=30))},
+        ),
+        make_event(
+            kind=TASK_STARTED,
+            actor=actor_exec,
+            task_id="t1",
+            chain_id="c1",
+            run_id="run1",
+            data={"executor_agent_id": "exec1", "backend": "codex"},
+        ),
+        make_event(
+            kind=REVIEWER_SUPERVISION_CLAIMED,
+            actor=Actor(type="agent", id="rev1", backend="claude"),
+            task_id="t1",
+            chain_id="c1",
+            run_id="run1",
+            data={"reviewer_agent_id": "rev1", "lease_expires_at": format_ts(initial_lease)},
+        ),
+        make_event(
+            kind=REVIEWER_SUPERVISION_HEARTBEAT,
+            actor=Actor(type="agent", id="rev2", backend="claude"),
+            task_id="t1",
+            chain_id="c1",
+            run_id="run1",
+            data={"reviewer_agent_id": "rev2", "lease_expires_at": format_ts(forged_lease)},
+        ),
+    ]
+
+    state = reduce_events(events)
+    run = state.runs["run1"]
+    assert run.reviewer_agent_id == "rev1"
+    assert format_ts(run.reviewer_lease_expires_at) == format_ts(initial_lease)

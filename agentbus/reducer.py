@@ -225,6 +225,9 @@ def reduce_events(events: list[dict[str, Any]]) -> ReducedState:
 
         elif kind == REVIEWER_SUPERVISION_HEARTBEAT and run_id and run_id in state.runs:
             run = state.runs[run_id]
+            heartbeat_reviewer_id = str(data.get("reviewer_agent_id") or "")
+            if not heartbeat_reviewer_id or run.reviewer_agent_id != heartbeat_reviewer_id:
+                continue
             lease_raw = data.get("lease_expires_at")
             if isinstance(lease_raw, str) and lease_raw:
                 run.reviewer_lease_expires_at = parse_ts(lease_raw)

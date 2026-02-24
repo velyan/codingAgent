@@ -1168,6 +1168,12 @@ def _claim_supervision(
     return True
 
 
+def _reviewer_owns_run(*, run: RunView | None, reviewer_agent_id: str) -> bool:
+    if run is None:
+        return False
+    return run.reviewer_agent_id == reviewer_agent_id
+
+
 def _reviewer_loop(*, store: JsonlEventStore, config: RunConfig, agent_state: AgentState) -> None:
     actor = Actor(type="agent", id=config.agent_id, backend=config.backend)
     cursor = EventCursor(line_no=0)
@@ -1194,6 +1200,7 @@ def _reviewer_loop(*, store: JsonlEventStore, config: RunConfig, agent_state: Ag
                     supervised_run_id = run.run_id
                     stream_buffer = []
                     last_review = time.monotonic()
+                    last_supervision_heartbeat = 0.0
 
         new_events, cursor = store.read_from(cursor)
         for event in new_events:
@@ -1208,23 +1215,38 @@ def _reviewer_loop(*, store: JsonlEventStore, config: RunConfig, agent_state: Ag
 
         if supervised_run_id is not None:
             run = state.runs.get(supervised_run_id)
-            if run is None or run.status in {"completed", "failed", "stopped"}:
-                if run is not None:
-                    kind = REVIEW_PASSED if run.status == "completed" else REVIEW_REWORK_REQUESTED
-                    store.append(
-                        make_event(
-                            kind=kind,
-                            actor=actor,
-                            task_id=run.task_id,
-                            chain_id=run.chain_id,
-                            run_id=run.run_id,
-                            data={
-                                "reason": "live supervision final gate",
-                            },
-                        )
-                    )
+            if run is None:
                 supervised_run_id = None
                 stream_buffer = []
+                last_supervision_heartbeat = 0.0
+                time.sleep(max(0.2, config.poll_seconds))
+                continue
+
+            if not _reviewer_owns_run(run=run, reviewer_agent_id=config.agent_id):
+                supervised_run_id = None
+                stream_buffer = []
+                last_supervision_heartbeat = 0.0
+                last_review = time.monotonic()
+                time.sleep(max(0.2, config.poll_seconds))
+                continue
+
+            if run.status in {"completed", "failed", "stopped"}:
+                kind = REVIEW_PASSED if run.status == "completed" else REVIEW_REWORK_REQUESTED
+                store.append(
+                    make_event(
+                        kind=kind,
+                        actor=actor,
+                        task_id=run.task_id,
+                        chain_id=run.chain_id,
+                        run_id=run.run_id,
+                        data={
+                            "reason": "live supervision final gate",
+                        },
+                    )
+                )
+                supervised_run_id = None
+                stream_buffer = []
+                last_supervision_heartbeat = 0.0
                 time.sleep(max(0.2, config.poll_seconds))
                 continue
 
