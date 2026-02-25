@@ -42,6 +42,49 @@ def _add_common_budget_flags(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--max-failures", type=int, default=DEFAULT_MAX_FAILURES)
 
 
+def _add_run_arguments(
+    parser: argparse.ArgumentParser,
+    *,
+    require_agent_id: bool,
+    role: str | None = None,
+    backend_default: str | None = "codex",
+    require_backend: bool = False,
+    autonomous_default: bool = False,
+) -> None:
+    parser.add_argument("--log-file", required=True)
+    parser.add_argument("--agent-id", default=f"{role}-agent" if role else None, required=require_agent_id)
+    parser.add_argument(
+        "--backend",
+        choices=["codex", "claude", "cursor"],
+        required=require_backend,
+        default=backend_default,
+    )
+    parser.add_argument("--cwd", required=True)
+    parser.add_argument("--backend-cmd")
+    parser.add_argument("--model")
+    parser.add_argument("--autonomous", action="store_true", default=autonomous_default)
+    parser.add_argument("--poll-seconds", type=float, default=DEFAULT_POLL_SECONDS)
+    parser.add_argument("--lease-seconds", type=int, default=DEFAULT_LEASE_SECONDS)
+    parser.add_argument("--heartbeat-seconds", type=int, default=DEFAULT_HEARTBEAT_SECONDS)
+    _add_common_budget_flags(parser)
+    parser.add_argument("--escalation-file")
+    parser.add_argument("--stream-chunk-bytes", type=int, default=DEFAULT_STREAM_CHUNK_BYTES)
+    parser.add_argument("--control-poll-ms", type=int, default=DEFAULT_CONTROL_POLL_MS)
+    parser.add_argument("--review-cadence-seconds", type=float, default=DEFAULT_REVIEW_CADENCE_SECONDS)
+    parser.add_argument("--reviewer-lease-seconds", type=int, default=DEFAULT_REVIEWER_LEASE_SECONDS)
+    parser.add_argument("--run-timeout-seconds", type=_positive_int, default=DEFAULT_RUN_TIMEOUT_SECONDS)
+    parser.add_argument("--pause-timeout-seconds", type=_positive_int, default=DEFAULT_PAUSE_TIMEOUT_SECONDS)
+    parser.add_argument("--max-nudges-per-run", type=_positive_int, default=DEFAULT_MAX_NUDGES_PER_RUN)
+    parser.add_argument("--max-restarts-per-run", type=_positive_int, default=DEFAULT_MAX_RESTARTS_PER_RUN)
+    parser.add_argument("--max-identical-failures", type=_positive_int, default=DEFAULT_MAX_IDENTICAL_FAILURES)
+
+
+def _resolve_parser_backend_default(role: str | None) -> str:
+    if role == "reviewer":
+        return "claude"
+    return "codex"
+
+
 def _positive_int(value: str) -> int:
     parsed = int(value)
     if parsed <= 0:
@@ -54,28 +97,38 @@ def _build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
 
     run = sub.add_parser("run", help="Run an agent loop")
-    run.add_argument("--log-file", required=True)
-    run.add_argument("--agent-id", required=True)
-    run.add_argument("--backend", required=True, choices=["codex", "claude", "cursor"])
+    _add_run_arguments(run, require_agent_id=True, require_backend=True)
     run.add_argument("--role", required=True, choices=["planner", "executor", "reviewer"])
-    run.add_argument("--cwd", required=True)
-    run.add_argument("--backend-cmd")
-    run.add_argument("--model")
-    run.add_argument("--autonomous", action="store_true")
-    run.add_argument("--poll-seconds", type=float, default=DEFAULT_POLL_SECONDS)
-    run.add_argument("--lease-seconds", type=int, default=DEFAULT_LEASE_SECONDS)
-    run.add_argument("--heartbeat-seconds", type=int, default=DEFAULT_HEARTBEAT_SECONDS)
-    _add_common_budget_flags(run)
-    run.add_argument("--escalation-file")
-    run.add_argument("--stream-chunk-bytes", type=int, default=DEFAULT_STREAM_CHUNK_BYTES)
-    run.add_argument("--control-poll-ms", type=int, default=DEFAULT_CONTROL_POLL_MS)
-    run.add_argument("--review-cadence-seconds", type=float, default=DEFAULT_REVIEW_CADENCE_SECONDS)
-    run.add_argument("--reviewer-lease-seconds", type=int, default=DEFAULT_REVIEWER_LEASE_SECONDS)
-    run.add_argument("--run-timeout-seconds", type=_positive_int, default=DEFAULT_RUN_TIMEOUT_SECONDS)
-    run.add_argument("--pause-timeout-seconds", type=_positive_int, default=DEFAULT_PAUSE_TIMEOUT_SECONDS)
-    run.add_argument("--max-nudges-per-run", type=_positive_int, default=DEFAULT_MAX_NUDGES_PER_RUN)
-    run.add_argument("--max-restarts-per-run", type=_positive_int, default=DEFAULT_MAX_RESTARTS_PER_RUN)
-    run.add_argument("--max-identical-failures", type=_positive_int, default=DEFAULT_MAX_IDENTICAL_FAILURES)
+
+    planner = sub.add_parser("planner", help="Start a planner agent")
+    planner.set_defaults(role="planner")
+    _add_run_arguments(
+        planner,
+        require_agent_id=False,
+        role="planner",
+        backend_default=_resolve_parser_backend_default("planner"),
+        autonomous_default=True,
+    )
+
+    executor = sub.add_parser("executor", help="Start an executor agent")
+    executor.set_defaults(role="executor")
+    _add_run_arguments(
+        executor,
+        require_agent_id=False,
+        role="executor",
+        backend_default=_resolve_parser_backend_default("executor"),
+        autonomous_default=True,
+    )
+
+    reviewer = sub.add_parser("reviewer", help="Start a reviewer agent")
+    reviewer.set_defaults(role="reviewer")
+    _add_run_arguments(
+        reviewer,
+        require_agent_id=False,
+        role="reviewer",
+        backend_default=_resolve_parser_backend_default("reviewer"),
+        autonomous_default=True,
+    )
 
     post_obj = sub.add_parser("post-objective", help="Post a new objective chain")
     post_obj.add_argument("--log-file", required=True)
@@ -125,7 +178,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
 
-    if args.command == "run":
+    if args.command in {"run", "planner", "executor", "reviewer"}:
         cfg = RunConfig(
             log_file=args.log_file,
             agent_id=args.agent_id,

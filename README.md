@@ -35,36 +35,31 @@ agentbus post-objective \
   --preferred-backends codex,claude
 ```
 
-### 2) Start executor (tab 1)
+### 2) Start agents with simple role commands
 
 ```bash
-agentbus run \
+agentbus planner \
+  --log-file /tmp/agentbus.jsonl \
+  --agent-id plan-codex \
+  --cwd /path/to/repo
+```
+
+```bash
+agentbus executor \
   --log-file /tmp/agentbus.jsonl \
   --agent-id exec-codex \
-  --backend codex \
-  --role executor \
-  --cwd /path/to/repo \
-  --run-timeout-seconds 1800 \
-  --pause-timeout-seconds 900 \
-  --max-nudges-per-run 3 \
-  --max-restarts-per-run 6 \
-  --max-identical-failures 3 \
-  --autonomous
+  --cwd /path/to/repo
 ```
-
-### 3) Start reviewer (tab 2)
 
 ```bash
-agentbus run \
+agentbus reviewer \
   --log-file /tmp/agentbus.jsonl \
   --agent-id rev-claude \
-  --backend claude \
-  --role reviewer \
-  --cwd /path/to/repo \
-  --autonomous
+  --model claude-3-opus \
+  --cwd /path/to/repo
 ```
 
-### 4) Live manual steering (optional)
+### 3) Live manual steering (optional)
 
 ```bash
 agentbus steer \
@@ -91,6 +86,9 @@ agentbus tail --log-file /tmp/agentbus.jsonl --follow
 - `agentbus requeue`
 - `agentbus tail`
 - `agentbus compact`
+- `agentbus planner`
+- `agentbus executor`
+- `agentbus reviewer`
 
 Run `agentbus <command> --help` for full options.
 
