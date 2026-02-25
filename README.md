@@ -59,6 +59,26 @@ agentbus reviewer \
   --cwd /path/to/repo
 ```
 
+### 2b) Start all three roles in one command
+
+```bash
+./scripts/agentbus-collab.sh \
+  --log-file /tmp/agentbus.jsonl \
+  --cwd /path/to/repo \
+  --planner-model gpt-4o-mini \
+  --executor-model claude-3.5-sonnet \
+  --reviewer-model claude-3-opus
+```
+
+The script starts:
+- `agentbus planner`
+- `agentbus executor`
+- `agentbus reviewer`
+
+and prints live role-prefixed events from the shared log (plus per-agent process logs).
+
+Add `--no-watch` if you only want agent processes started in background.
+
 ### 3) Live manual steering (optional)
 
 ```bash
@@ -89,6 +109,7 @@ agentbus tail --log-file /tmp/agentbus.jsonl --follow
 - `agentbus planner`
 - `agentbus executor`
 - `agentbus reviewer`
+- `scripts/agentbus-collab.sh`
 
 Run `agentbus <command> --help` for full options.
 

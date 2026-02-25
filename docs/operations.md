@@ -12,6 +12,17 @@ agentbus run --log-file /tmp/agentbus.jsonl --agent-id exec1 --backend codex --r
 agentbus run --log-file /tmp/agentbus.jsonl --agent-id rev1 --backend claude --role reviewer --cwd /repo --autonomous
 ```
 
+For a quick three-process launch with model defaults per role, use:
+
+```bash
+./scripts/agentbus-collab.sh \
+  --log-file /tmp/agentbus.jsonl \
+  --cwd /repo \
+  --planner-model gpt-4o-mini \
+  --executor-model claude-3.5-sonnet \
+  --reviewer-model claude-3-opus
+```
+
 ## Monitor
 
 ```bash
