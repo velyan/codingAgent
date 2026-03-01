@@ -1,7 +1,5 @@
 # AgentBus
 
-HELLO!!!!!
-
 AgentBus is a POSIX Python CLI for collaborative coding agents that coordinate through a single append-only JSONL log.
 
 It supports:
